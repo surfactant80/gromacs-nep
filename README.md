@@ -70,7 +70,6 @@ MODEL=/path/to/nep.txt examples/nep-mm-methane-water/run-test.sh
 
 - 基于 **GROMACS 2026.3**；
 - 内嵌 **GPUMD** 源码（`src/external/gpumd`，与 GPUMD-master 的 NEP/qNEP 力核逐字节一致）；
-- 本版源码包：`gromacs-2026.3-gpumd-vendor-source-20260818.tar.gz`（SHA-256 见 GitHub 发布页面）。
 
 ## 引用要求
 
@@ -175,7 +174,6 @@ See `docs/NEP-GPUMD.md` and the validation scripts under `test/` for details.
 
 - Based on **GROMACS 2026.3**;
 - Vendored **GPUMD** source tree (`src/external/gpumd`; NEP/qNEP force kernels are byte-identical to GPUMD-master);
-- This release: `gromacs-2026.3-gpumd-vendor-source-20260818.tar.gz` (SHA-256: see the GitHub release page).
 
 ## Citation Requirement
 
