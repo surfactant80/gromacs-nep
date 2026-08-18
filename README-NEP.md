@@ -102,7 +102,6 @@ MODEL=/path/to/nep.txt examples/nep-mm-methane-water/run-test.sh
 
 # GROMACS–GPUMD NEP/qNEP Integration (English Statement)
 
-> For a GitHub repository root, rename this file to `README.md`.
 
 ## Overview
 
