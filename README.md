@@ -1,6 +1,5 @@
-# GROMACS–GPUMD NEP/qNEP 集成版（中文声明）
+# GROMACS–GPUMD NEP/qNEP 集成版
 
-> 放置于 GitHub 仓库根目录时，可将本文件重命名为 `README.md`。
 
 ## 简介
 
@@ -103,7 +102,7 @@ MODEL=/path/to/nep.txt examples/nep-mm-methane-water/run-test.sh
 
 ---
 
-# GROMACS–GPUMD NEP/qNEP Integration (English Statement)
+# GROMACS–GPUMD NEP/qNEP Integration 
 
 > For a GitHub repository root, rename this file to `README.md`.
 
