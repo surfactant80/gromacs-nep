@@ -1,0 +1,29 @@
+# This file was created Fri Aug 14 12:14:59 2026
+# Created by:
+#                      :-) GROMACS - gmx energy, 2026.3 (-:
+# 
+# Executable:   /media/hydrate/FDA4F9EDE8FFCA60/deepseek-test/gromacs-2026.3-gpumd-vendor-source-20260812-adaptive/gromacs-2026.3-gpumd-vendor/build-nep/bin/gmx
+# Data prefix:  /media/hydrate/FDA4F9EDE8FFCA60/deepseek-test/gromacs-2026.3-gpumd-vendor-source-20260812-adaptive/gromacs-2026.3-gpumd-vendor (source tree)
+# Working dir:  /media/hydrate/FDA4F9EDE8FFCA60/deepseek-test/gromacs-2026.3-gpumd-vendor-source-20260812-adaptive/gromacs-2026.3-gpumd-vendor/examples/nep-mm-methane-water/work
+# Command line:
+#   gmx energy -f device.edr -o device-energy.xvg
+# gmx energy is part of G R O M A C S:
+#
+# Gravel Rubs Often Many Awfully Cauterized Sores
+#
+@    title "GROMACS Energies"
+@    xaxis  label "Time (ps)"
+@    yaxis  label "(kJ/mol)"
+@TYPE xy
+@ view 0.15, 0.15, 0.75, 0.85
+@ legend on
+@ legend box on
+@ legend loctype view
+@ legend 0.78, 0.8
+@ legend length 2
+@ s0 legend "LJ (SR)"
+@ s1 legend "Coulomb (SR)"
+@ s2 legend "Coul. recip."
+@ s3 legend "NN Potential"
+@ s4 legend "Potential"
+    0.000000  197149360.000000  -116191.515625  134.207504    0.120204  197033296.000000

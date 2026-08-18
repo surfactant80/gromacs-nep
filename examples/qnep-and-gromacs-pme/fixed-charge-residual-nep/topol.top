@@ -1,0 +1,10 @@
+[ defaults ]
+1 2 no 1.0 1.0
+[ atomtypes ]
+H 1 1.008 0 A 0 0
+O 8 15.9994 0 A 0 0
+#include "system.itp"
+[ system ]
+Fixed-charge PME plus residual NEP
+[ molecules ]
+SYS 1

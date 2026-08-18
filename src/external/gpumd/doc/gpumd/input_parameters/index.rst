@@ -1,0 +1,91 @@
+.. _gpumd_input_parameters:
+.. index::
+   single: gpumd input parameters
+
+Input parameters
+================
+
+Below you can find a listing of keywords for the ``run.in`` input file.
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Setup
+
+   replicate
+   velocity
+   correct_velocity
+   potential
+   compute_extrapolation
+   dftd3
+   change_box
+   deform
+   time_step
+   ensemble
+   ensemble_standard
+   ensemble_mttk
+   ensemble_qtb
+   ensemble_heat
+   ensemble_ttm
+   ensemble_pimd
+   ensemble_ti_liquid
+   ensemble_ti_spring
+   ensemble_ti_as
+   ensemble_ti_rs
+   ensemble_ti
+   ensemble_shock_nemd
+   ensemble_msst
+   ensemble_nphug
+   add_force
+   add_efield
+   add_spring
+   deposit
+   electron_stop
+   fix
+   kspace
+   move
+   mc
+   plumed
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Actions
+
+   minimize
+   run
+   compute
+   compute_chunk
+   compute_adf
+   compute_cohesive
+   compute_dos
+   compute_dpdt
+   compute_elastic
+   compute_gkma
+   compute_hac
+   compute_hnema
+   compute_hnemd
+   compute_hnemdec
+   compute_ic
+   compute_orientorder
+   compute_phonon
+   compute_sdc
+   compute_msd
+   compute_shc
+   compute_viscosity
+   compute_lsqt
+   compute_rdf
+   compute_angular_rdf
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Output
+   
+   active
+   dump_xyz
+   dump_beads
+   dump_observer
+   dump_dipole
+   dump_polarizability
+   dump_netcdf
+   dump_restart
+   dump_thermo
+   dump_shock_nemd

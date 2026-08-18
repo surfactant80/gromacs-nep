@@ -1,0 +1,19 @@
+[ defaults ]
+1 2 yes 0.5 0.8333
+
+[ atomtypes ]
+; name at.num mass charge ptype sigma epsilon
+c3 6 12.0100 0 A 0.339967 0.457730
+hc 1  1.0080 0 A 0.264953 0.0656888
+OW 8 15.9994 0 A 0.315061 0.636386
+HW 1  1.0080 0 A 0.000000 0.000000
+
+#include "CH4.itp"
+#include "SOL.itp"
+
+[ system ]
+One NEP methane mechanically embedded in MM water/methane
+
+[ molecules ]
+SOL 2070
+CH4 360
