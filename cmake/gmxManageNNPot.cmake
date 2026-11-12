@@ -38,6 +38,13 @@ gmx_option_multichoice(GMX_NNPOT
     AUTO TORCH NEP OFF
 )
 
+# Wisevolve Potential Engine backend. The proprietary engine is dlopen()ed at
+# run time, so enabling this option neither links libwisevolve_potential.so nor
+# requires it at configure time. Only the public BSD-2-Clause API header is
+# vendored under src/external/wpe.
+option(GMX_NEP_WPE "Enable the Wisevolve Potential Engine (WPE) NEP backend" OFF)
+set(GMX_WPE_LIBRARY "" CACHE PATH "Optional hint for libwisevolve_potential.so; runtime loading also honours GMX_WPE_LIBRARY and LD_LIBRARY_PATH")
+
 if(TORCH_ALREADY_SEARCHED)
     set(FIND_TORCH_QUIETLY ON)
 endif()

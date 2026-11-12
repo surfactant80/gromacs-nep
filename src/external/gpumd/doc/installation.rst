@@ -29,6 +29,7 @@ Prerequisites
       On Windows systems, one also needs the ``cl.exe`` compiler from Microsoft Visual Studio and CMake 3.24 or newer.
 
 .. _compilation:
+.. _build_gpumd_replica:
 
 Compilation
 ===========
@@ -37,7 +38,7 @@ Compilation
 
    .. tab:: Make
 
-      In the ``src`` directory run ``make``, which generates two executables, ``nep`` and ``gpumd``.
+      In the ``src`` directory run ``make``, which generates three executables: ``nep``, ``gpumd``, and ``gpumd_replica``.
       Please check the comments in the beginning of the makefile for some compiling options.
 
    .. tab:: CMake (pre-release)
@@ -85,12 +86,32 @@ Examples
 ========
 
 You can find several examples for how to use both the ``gpumd`` and ``nep`` executables in `the examples directory <https://github.com/brucefan1983/GPUMD/tree/master/examples>`_ of the :program:`GPUMD` repository.
-
-
-.. _netcdf_setup:
-.. index::
-   single: NetCDF setup
    
+GPU selection and multi-GPU execution
+=====================================
+
+The ``nep`` executable uses all GPUs visible to the process. On CUDA systems,
+use ``CUDA_VISIBLE_DEVICES`` to select a subset, for example::
+
+  CUDA_VISIBLE_DEVICES=0 ./nep
+  CUDA_VISIBLE_DEVICES=0,1 ./nep
+
+The ``gpumd`` executable also uses all visible GPUs when running standard NEP
+or temperature-dependent NEP models, and ``nep_spin`` spin models.
+For example::
+
+  CUDA_VISIBLE_DEVICES=0,1 ./gpumd
+
+Charge NEP models currently use the single-GPU implementation in ``gpumd``.
+On managed clusters, request GPUs through the scheduler and use the device
+visibility configured by the scheduler.
+
+For multi-GPU runs, GPUs with similar performance are recommended because
+synchronization can cause faster devices to wait for slower ones. For NEP
+molecular dynamics, GPUMD chooses the spatial partition direction automatically.
+The optional manual ``x``, ``y``, or ``z`` partition direction is documented
+with the :ref:`potential keyword <kw_potential>`.
+
 GNEP setup
 ==========
 
@@ -112,7 +133,7 @@ See the `implementation paper <https://doi.org/10.1016/j.cpc.2025.109994/>`_ for
         cmake --build build --target gnep
 
 The usage of the ``gnep`` executable is similar to that of the ``nep`` executable.
-The major difference is that training hyperparameters are written in ``gnep.in`` instead of ``nep.in``'
+The major difference is that training hyperparameters are written in ``gnep.in`` instead of ``nep.in``
 Below we use an explicit example with default parameters (except for the ``type`` keyword) to illustrate the inputs in ``gnep.in``::
 
   type         2 Ge Se      # same usage as in nep.in
@@ -128,8 +149,68 @@ Below we use an explicit example with default parameters (except for the ``type`
   start_lr     1e-3         # new keyword to set the starting learning rate, which should be a non-negative floating-point number
   stop_lr      1e-7         # new keyword to set the stopping learning rate, which should be a non-negative floating-point number
   weight_decay 0.0          # new keyword to set the weight decay parameter, which should be a non-negative floating-point number
-  batch        2            # same usage as in nep.in but favors small values
+  batch        2            # global batch size; it does not grow with the number of visible GPUs
   epoch        50           # one epoch equals #structures/#batchsize training steps
+  seed         20260831     # optional non-negative seed for parameter initialization and batch shuffling
+
+GNEP uses every GPU made visible through ``CUDA_VISIBLE_DEVICES`` on one node.
+Each complete configuration belongs to exactly one GPU shard; configurations
+are never split across devices. A training step still performs one global Adam
+update, so ``batch`` has the same meaning for one, two, or more GPUs. For
+example, the following commands run an otherwise identical deterministic job
+on one, two, and four GPUs::
+
+  CUDA_VISIBLE_DEVICES=0 ./gnep
+  CUDA_VISIBLE_DEVICES=0,1 ./gnep
+  CUDA_VISIBLE_DEVICES=0,1,2,3 ./gnep
+
+Global batch size and multi-GPU efficiency
+------------------------------------------
+
+The ``batch`` keyword is the number of complete configurations used by one
+global Adam update across all visible GPUs. It is a global batch size, not a
+per-GPU batch size, and it must be kept unchanged when comparing otherwise
+identical one-, two-, and four-GPU runs. Changing ``batch`` changes the
+optimization problem seen by each Adam step and can therefore change the
+training trajectory.
+
+GNEP distributes complete configurations and never splits the atoms or
+neighbor graph of one configuration across GPUs. Consequently, the number of
+active GPUs in a step is::
+
+  min(number of visible GPUs, number of configurations in the current batch)
+
+``batch 1`` is valid and follows the same training algorithm, but only one GPU
+can perform useful work in each step. To allow every visible GPU to participate,
+use a global batch of at least 2 for two GPUs or at least 4 for four GPUs. The
+last incomplete batch of an epoch can use fewer GPUs when it contains fewer
+configurations. For example, a global batch of 4 is analogous to assigning one
+configuration to each of four GPUs before one synchronized Adam update; it is
+not equivalent to four independent ``batch 1`` updates.
+
+Multi-GPU efficiency depends on the amount of work in each global batch. Very
+small configurations or a small global batch can be slower on multiple GPUs
+because host worker startup, gradient reduction, and synchronization dominate
+the GPU computation. Increase ``batch`` only as permitted by GPU memory and the
+desired optimization behavior. Benchmark with the same global batch, dataset,
+seed, and number of epochs on every GPU count, and exclude the first warm-up
+step when reporting step time.
+
+As a reference rather than a hardware-independent guarantee, a validation run
+with 3810 training configurations, 100 test configurations, global ``batch 80``,
+and RTX 4090 GPUs measured median step times of 0.462856, 0.263450, and 0.151553
+seconds on one, two, and four GPUs, respectively. These correspond to 1.76x and
+3.05x speedups, while the serialized loss and RMSE trajectories were identical
+for all three runs.
+
+When ``seed`` is omitted, GNEP retains the historical behavior: parameter
+initialization uses its existing default seed and epoch batch shuffling obtains
+entropy from ``std::random_device``. Model, restart, prediction, and training
+output formats are unchanged.
+
+.. _netcdf_setup:
+.. index::
+   single: NetCDF setup
 
 NetCDF setup
 ============
@@ -690,4 +771,3 @@ References
 * jse: https://github.com/liqa1024/jse
 * jse-skill: https://github.com/liqa1024/jse-skill
 * jsex-NNAP: https://github.com/liqa1024/jsex-NNAP
-

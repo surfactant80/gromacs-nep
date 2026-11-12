@@ -34,12 +34,19 @@
 set(testname NNPotAppliedForcesUnitTest)
 set(exename nnpot_applied_forces-test)
 
+set(nnpot_test_sources
+    nnpot.cpp
+    nnpotoptions.cpp
+    nnpottopologypreprocessor.cpp
+)
+if (GMX_NNPOT STREQUAL "NEP")
+    list(APPEND nnpot_test_sources nepmodelinfo.cpp)
+endif()
+
 gmx_add_unit_test(${testname} ${exename}
     HARDWARE_DETECTION
     CPP_SOURCE_FILES
-        nnpot.cpp
-        nnpotoptions.cpp
-        nnpottopologypreprocessor.cpp
+        ${nnpot_test_sources}
     GPU_CPP_SOURCE_FILES
         nnpotforceprovider.cpp
 )

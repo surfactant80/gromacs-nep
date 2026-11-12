@@ -105,6 +105,8 @@ const std::string c_nnpChargeTag_     = "nnp-charge";
 const std::string c_embeddingTag_     = "embedding";
 const std::string c_useGromacsElectrostaticsTag_ = "use-gromacs-electrostatics";
 const std::string c_gromacsChargesTag_ = "gromacs-charges";
+const std::string c_chargesNstTag_     = "charges-nst";
+const std::string c_chargesOutputTag_  = "charges-output";
 const std::string c_energyOffsetsTag_ = "energy-offsets";
 const std::string c_adaptiveModeTag_ = "adaptive-mode";
 const std::string c_adaptiveGroupBTag_ = "adaptive-group-b";
@@ -112,6 +114,13 @@ const std::string c_adaptiveModelFileNameTag_ = "adaptive-modelfile";
 const std::string c_adaptiveModelIsDeltaTag_ = "adaptive-model-is-delta";
 const std::string c_adaptiveInnerCutoffTag_ = "adaptive-inner-cutoff";
 const std::string c_adaptiveOuterCutoffTag_ = "adaptive-outer-cutoff";
+const std::string c_backendTag_          = "backend";
+const std::string c_wpeLibraryTag_       = "wpe-library";
+const std::string c_wpeKspaceTag_        = "wpe-kspace";
+const std::string c_wpePppmSpacingTag_   = "wpe-pppm-spacing";
+const std::string c_gpumdKspaceTag_      = "gpumd-kspace";
+const std::string c_gpumdPppmSpacingTag_ = "gpumd-pppm-spacing";
+const std::string c_dftd3Tag_            = "dftd3";
 
 //! The names of the supported embedding schemes
 const EnumerationArray<NNPotEmbedding, const char*> c_embeddingSchemeNames = {
@@ -156,20 +165,6 @@ const std::string c_adaptiveBGroupTag_ = "adaptive-b-group";
 const std::string c_adaptiveBMoleculeStartsTag_ = "adaptive-b-molecule-starts";
 const std::string c_adaptiveBMoleculeSizesTag_ = "adaptive-b-molecule-sizes";
 //! \}
-
-std::string readModelHeader(const std::string& filename)
-{
-    std::ifstream input(filename);
-    std::string header;
-    input >> header;
-    return header;
-}
-
-bool isQnepHeader(const std::string& header)
-{
-    return header == "nep4_charge1" || header == "nep4_zbl_charge1"
-           || header == "nep4_charge2" || header == "nep4_zbl_charge2";
-}
 
 void disableFullSystemClassicalNonbonded(gmx_mtop_t* mtop, const MDLogger& logger)
 {
@@ -370,6 +365,10 @@ void NNPotOptions::initMdpTransform(IKeyValueTreeTransformRules* rules)
                                     c_useGromacsElectrostaticsTag_);
     addMdpTransformFromString<bool>(
             rules, &fromStdString<bool>, NNPotModuleInfo::sc_name, c_gromacsChargesTag_);
+    addMdpTransformFromString<int64_t>(
+            rules, &fromStdString<int64_t>, NNPotModuleInfo::sc_name, c_chargesNstTag_);
+    addMdpTransformFromString<std::string>(
+            rules, stringIdentityTransform, NNPotModuleInfo::sc_name, c_chargesOutputTag_);
     addMdpTransformFromString<std::string>(
             rules, stringIdentityTransform, NNPotModuleInfo::sc_name, c_energyOffsetsTag_);
     addMdpTransformFromString<std::string>(
@@ -404,6 +403,20 @@ void NNPotOptions::initMdpTransform(IKeyValueTreeTransformRules* rules)
             rules, stringIdentityTransform, NNPotModuleInfo::sc_name, c_modelInput8Tag_);
     addMdpTransformFromString<std::string>(
             rules, stringIdentityTransform, NNPotModuleInfo::sc_name, c_modelInput9Tag_);
+    addMdpTransformFromString<std::string>(
+            rules, stringIdentityTransform, NNPotModuleInfo::sc_name, c_backendTag_);
+    addMdpTransformFromString<std::string>(
+            rules, stringIdentityTransform, NNPotModuleInfo::sc_name, c_wpeLibraryTag_);
+    addMdpTransformFromString<std::string>(
+            rules, stringIdentityTransform, NNPotModuleInfo::sc_name, c_wpeKspaceTag_);
+    addMdpTransformFromString<real>(
+            rules, &fromStdString<real>, NNPotModuleInfo::sc_name, c_wpePppmSpacingTag_);
+    addMdpTransformFromString<std::string>(
+            rules, stringIdentityTransform, NNPotModuleInfo::sc_name, c_gpumdKspaceTag_);
+    addMdpTransformFromString<real>(
+            rules, &fromStdString<real>, NNPotModuleInfo::sc_name, c_gpumdPppmSpacingTag_);
+    addMdpTransformFromString<std::string>(
+            rules, stringIdentityTransform, NNPotModuleInfo::sc_name, c_dftd3Tag_);
 }
 
 void NNPotOptions::initMdpOptions(IOptionsContainerWithSections* options)
@@ -422,6 +435,15 @@ void NNPotOptions::initMdpOptions(IOptionsContainerWithSections* options)
                               .store(&params_.useGromacsElectrostatics_));
     section.addOption(
             BooleanOption(c_gromacsChargesTag_.c_str()).store(&params_.gromacsCharges_));
+    section.addOption(Int64Option(c_chargesNstTag_.c_str())
+                              .description("Write the qNEP atomic charges to a binary charge "
+                                           "trajectory every N steps (0 = off).")
+                              .defaultValue(0)
+                              .store(&params_.chargesNst_));
+    section.addOption(StringOption(c_chargesOutputTag_.c_str())
+                              .description("Output file for the dynamic qNEP charges.")
+                              .defaultValue("qnep-charges.qnc")
+                              .store(&params_.chargesOutput_));
     section.addOption(StringOption(c_energyOffsetsTag_.c_str()).store(&params_.energyOffsets_));
     section.addOption(EnumOption<NNPotAdaptiveMode>(c_adaptiveModeTag_.c_str())
                               .enumValue(c_adaptiveModeNames)
@@ -436,6 +458,15 @@ void NNPotOptions::initMdpOptions(IOptionsContainerWithSections* options)
     section.addOption(
             RealOption(c_adaptiveOuterCutoffTag_.c_str()).store(&params_.adaptiveOuterCutoff_));
     section.addOption(RealOption(c_nnpChargeTag_.c_str()).store(&params_.nnpCharge_));
+    section.addOption(StringOption(c_backendTag_.c_str()).store(&params_.backend_));
+    section.addOption(StringOption(c_wpeLibraryTag_.c_str()).store(&params_.wpeLibrary_));
+    section.addOption(StringOption(c_wpeKspaceTag_.c_str()).store(&params_.wpeKspace_));
+    section.addOption(
+            RealOption(c_wpePppmSpacingTag_.c_str()).store(&params_.wpePppmSpacing_));
+    section.addOption(StringOption(c_gpumdKspaceTag_.c_str()).store(&params_.gpumdKspace_));
+    section.addOption(
+            RealOption(c_gpumdPppmSpacingTag_.c_str()).store(&params_.gpumdPppmSpacing_));
+    section.addOption(StringOption(c_dftd3Tag_.c_str()).store(&params_.dftd3_));
     section.addOption(StringOption(c_modelInput1Tag_.c_str()).store(&params_.modelInput_[0]));
     section.addOption(StringOption(c_modelInput2Tag_.c_str()).store(&params_.modelInput_[1]));
     section.addOption(StringOption(c_modelInput3Tag_.c_str()).store(&params_.modelInput_[2]));
@@ -477,6 +508,24 @@ void NNPotOptions::buildMdpOutput(KeyValueTreeObjectBuilder* builder) const
                                 params_.gromacsCharges_);
         addMdpOutputValue<std::string>(
                 builder, NNPotModuleInfo::sc_name, c_energyOffsetsTag_, params_.energyOffsets_);
+        addMdpOutputValue<std::string>(
+                builder, NNPotModuleInfo::sc_name, c_backendTag_, params_.backend_);
+        addMdpOutputValue<std::string>(
+                builder, NNPotModuleInfo::sc_name, c_wpeLibraryTag_, params_.wpeLibrary_);
+        addMdpOutputValue<std::string>(
+                builder, NNPotModuleInfo::sc_name, c_wpeKspaceTag_, params_.wpeKspace_);
+        addMdpOutputValue<real>(builder,
+                                NNPotModuleInfo::sc_name,
+                                c_wpePppmSpacingTag_,
+                                params_.wpePppmSpacing_);
+        addMdpOutputValue<std::string>(
+                builder, NNPotModuleInfo::sc_name, c_gpumdKspaceTag_, params_.gpumdKspace_);
+        addMdpOutputValue<real>(builder,
+                                NNPotModuleInfo::sc_name,
+                                c_gpumdPppmSpacingTag_,
+                                params_.gpumdPppmSpacing_);
+        addMdpOutputValue<std::string>(
+                builder, NNPotModuleInfo::sc_name, c_dftd3Tag_, params_.dftd3_);
         addMdpOutputValue<std::string>(builder,
                                        NNPotModuleInfo::sc_name,
                                        c_adaptiveModeTag_,
@@ -766,6 +815,10 @@ void NNPotOptions::adjustInputrec(t_inputrec* inputrec)
     const std::filesystem::path modelPath(params_.modelFileName_);
     const bool isNepModel =
             (modelPath.extension() == ".txt" || modelPath.extension() == ".nep");
+    if (isNepModel)
+    {
+        setEnsembleNameFromInputrec(*inputrec);
+    }
     if (params_.gromacsCharges_)
     {
         // The qNEP model provides the dynamic charges and GROMACS owns the
@@ -870,6 +923,8 @@ void NNPotOptions::writeParamsToKvt(KeyValueTreeObjectBuilder treeBuilder)
         moleculeSizeAdder.addValue(molecule.size());
     }
 
+    treeBuilder.addValue<std::string>(moduleName() + "-ensemble", params_.ensembleName_);
+
     // check that the model and model inputs are valid
     checkNNPotModel();
 }
@@ -880,6 +935,11 @@ void NNPotOptions::readParamsFromKvt(const KeyValueTreeObject& tree)
     if (!params_.active_)
     {
         return;
+    }
+
+    if (tree.keyExists(moduleName() + "-ensemble"))
+    {
+        params_.ensembleName_ = tree[moduleName() + "-ensemble"].cast<std::string>();
     }
 
     // Try to read input atoms index
@@ -1046,12 +1106,14 @@ void NNPotOptions::checkNNPotModel()
     const std::filesystem::path modelPath(params_.modelFileName_);
     if (modelPath.extension() == ".txt" || modelPath.extension() == ".nep")
     {
-        const std::string header = readModelHeader(params_.modelFileName_);
+        // CPU-only model inspection: supports both the legacy NEP4/qNEP files
+        // and the new "nep <N> <elements>" format without initializing CUDA.
+        const NepModelInfo info = readNepModelInfo(params_.modelFileName_);
         if (params_.adaptiveMode_ != NNPotAdaptiveMode::Off)
         {
-            const std::string adaptiveHeader =
-                    readModelHeader(params_.adaptiveModelFileName_);
-            if (isQnepHeader(adaptiveHeader))
+            const NepModelInfo adaptiveInfo =
+                    readNepModelInfo(params_.adaptiveModelFileName_);
+            if (isQnepModel(adaptiveInfo))
             {
                 GMX_THROW(InconsistentInputError(
                         "Adaptive NEP/MM does not support qNEP models. Dynamic qNEP "
@@ -1059,10 +1121,10 @@ void NNPotOptions::checkNNPotModel()
                         "the selected atom set. Use a plain delta-NEP model."));
             }
         }
-        if (isQnepHeader(header) && params_.useGromacsElectrostatics_)
+        if (isQnepModel(info) && params_.useGromacsElectrostatics_)
         {
             GMX_THROW(InconsistentInputError(
-                    "A native qNEP charge1/charge2 model already contains dynamic-charge "
+                    "A native qNEP model already contains dynamic-charge "
                     "electrostatics and its charge-response chain-rule forces. Enabling "
                     "nnpot-use-gromacs-electrostatics would double count electrostatics. "
                     "Use native qNEP mode, or train a plain short-range residual NEP against "
@@ -1070,7 +1132,7 @@ void NNPotOptions::checkNNPotModel()
         }
         if (params_.gromacsCharges_)
         {
-            if (!isQnepHeader(header))
+            if (!isQnepModel(info))
             {
                 GMX_THROW(InconsistentInputError(
                         "nnpot-gromacs-charges requires a qNEP charge1/charge2 model; "
@@ -1082,16 +1144,48 @@ void NNPotOptions::checkNNPotModel()
                         "nnpot-gromacs-charges and nnpot-use-gromacs-electrostatics are "
                         "mutually exclusive."));
             }
+            if (nepBackendSettings().backend == NepBackend::Wpe)
+            {
+                GMX_THROW(InconsistentInputError(
+                        "nnpot-gromacs-charges needs the vendored GPUMD backend (the charge "
+                        "response chain rule reads GPUMD descriptor kernels); WPE owns the "
+                        "qNEP electrostatics internally. Use nnpot-backend = gpumd, or run "
+                        "native qNEP electrostatics with WPE."));
+            }
         }
         if (params_.embeddingScheme_ != NNPotEmbedding::Mechanical)
         {
             GMX_THROW(NotImplementedError(
                     "NEP/MM currently supports mechanical embedding only."));
         }
+        if (params_.wpeKspace_ != "pppm" && params_.wpeKspace_ != "ewald")
+        {
+            GMX_THROW(InconsistentInputError(
+                    "nnpot-wpe-kspace must be 'pppm' or 'ewald'."));
+        }
+        if (params_.gpumdKspace_ != "pppm" && params_.gpumdKspace_ != "ewald")
+        {
+            GMX_THROW(InconsistentInputError(
+                    "nnpot-gpumd-kspace must be 'pppm' or 'ewald'."));
+        }
+        if (params_.wpePppmSpacing_ < 0.2 || params_.wpePppmSpacing_ > 2.0)
+        {
+            GMX_THROW(InconsistentInputError(
+                    "nnpot-wpe-pppm-spacing must be between 0.2 and 2.0 Angstrom."));
+        }
+        // Constructing the model here validates the backend choice for grompp:
+        // no CUDA context, no WPE library load, and no engine instance is
+        // created. The actual engine is built lazily in mdrun.
         MpiComm comm(MpiComm::SingleRank{});
-        NepModel model(params_.modelFileName_, logger(), comm);
-        GMX_LOG(logger().info).appendText(
-                "Using GPUMD NEP backend (CUDA) for the NNP region.");
+        NepModel model(params_.modelFileName_,
+                       logger(),
+                       comm,
+                       params_.gromacsCharges_,
+                       nepBackendSettings());
+        GMX_LOG(logger().info)
+                .appendText("NEP model: " + describeNepModel(info) + "\n");
+        GMX_LOG(logger().info)
+                .appendText("Selected NEP backend: " + model.backendDescription() + "\n");
         return;
     }
 #endif
@@ -1236,6 +1330,33 @@ void NNPotOptions::checkNNPotModel()
             "Libtorch/NN backend is not linked into GROMACS, NNPot simulation is not possible."
             " Please, reconfigure GROMACS with -DGMX_NNPOT=TORCH\n"));
 #endif // GMX_TORCH
+}
+
+NepBackendSettings NNPotOptions::nepBackendSettings() const
+{
+    return makeNepBackendSettings(params_);
+}
+
+NepBackendSettings makeNepBackendSettings(const NNPotParameters& parameters)
+{
+    NepBackendSettings settings;
+    settings.backend         = nepBackendFromString(parameters.backend_);
+    settings.wpeLibrary      = parameters.wpeLibrary_;
+    settings.wpeKspace       = parameters.wpeKspace_;
+    settings.wpePppmSpacing  = parameters.wpePppmSpacing_;
+    settings.gpumdKspace     = parameters.gpumdKspace_;
+    settings.gpumdPppmSpacing = parameters.gpumdPppmSpacing_;
+    settings.dftd3           = parameters.dftd3_;
+    settings.ensembleName    = parameters.ensembleName_;
+    settings.wantChargeOutput = parameters.chargesNst_ > 0;
+    return settings;
+}
+
+void NNPotOptions::setEnsembleNameFromInputrec(const t_inputrec& inputrec)
+{
+    const bool isNpt = inputrec.pressureCouplingOptions.epc != PressureCoupling::No;
+    const bool isNvt = inputrec.etc != TemperatureCoupling::No;
+    params_.ensembleName_ = isNpt ? "npt" : (isNvt ? "nvt" : "nve");
 }
 
 } // namespace gmx

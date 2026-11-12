@@ -2605,9 +2605,18 @@ void print_dd_statistics(gmx_domdec_t* dd, const t_inputrec& inputrec, FILE* fpl
     }
     fprintf(fplog, "\n");
 
-    if (comm.ddSettings.recordLoad && EI_DYNAMICS(inputrec.eI))
+    if (EI_DYNAMICS(inputrec.eI))
     {
-        print_dd_load_av(fplog, dd);
+        if (comm.ddSettings.recordLoad)
+        {
+            print_dd_load_av(fplog, dd);
+        }
+        else if (dd->comm->ddSettings.recordLoadDisabledByHaloOnGpu && fplog)
+        {
+            fprintf(fplog,
+                    "\nCould not measure load imbalance because halo exchange was performed on "
+                    "GPU\n");
+        }
     }
 }
 

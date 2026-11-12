@@ -2,15 +2,15 @@
     Copyright 2017 Zheyong Fan and GPUMD development team
     This file is part of GPUMD.
     GPUMD is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
+    it under the terms of the GNU Lesser General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
     GPUMD is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-    You should have received a copy of the GNU General Public License
-    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+    GNU Lesser General Public License for more details.
+    You should have received a copy of the GNU Lesser General Public License
+    along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 /*----------------------------------------------------------------------------80
@@ -20,12 +20,14 @@ The class dealing with the Deep Potential(DP).
 #ifdef USE_DEEPMD
 #include "dp.cuh"
 #include "neighbor.cuh"
+#include "model/box.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include <thrust/execution_policy.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
 #include <cmath>
+#include <cstdint>
 #include <sstream>
 #include <cstring>
 
@@ -41,11 +43,13 @@ DP::DP(const char* filename_dp, int num_atoms)
   initialize_dp(filename_dp);
 
 
-  dp_data.NN.resize(num_atoms);
-  dp_data.NL.resize(num_atoms * MAX_NEIGH_NUM_DP); // the largest supported by CUDA
-  dp_data.cell_count.resize(num_atoms);
-  dp_data.cell_count_sum.resize(num_atoms);
-  dp_data.cell_contents.resize(num_atoms);
+  // Global neighbor list at rc + skin (Neighbor owns the cell-list and
+  // reference-position buffers); MAX_NEIGH_NUM_DP is the rc-cutoff estimate
+  // that Neighbor pads by (rc + skin)^3 / rc^3. The per-step rc-filtered list
+  // reuses the same column-major (stride N) layout.
+  dp_neighbor.initialize(rc, num_atoms, MAX_NEIGH_NUM_DP);
+  dp_NN_local.resize(num_atoms);
+  dp_NL_local.resize(dp_neighbor.NL.size());
   type_cpu.resize(num_atoms);
   e_f_v_gpu.resize(num_atoms * (1 + 3 + 9));    // energy: 1; force: 3; virial: 9
 
@@ -518,7 +522,384 @@ static __global__ void create_ghost_map(
   }
 }
 
+// Periodic cell grids with fewer cells than the five-cell search stencil can
+// visit the same wrapped cell more than once.  The global-list sorter ranks
+// equal atom indices at the same position, so such duplicates are not
+// guaranteed to remain adjacent: colliding writes can leave older valid
+// neighbor entries in the intervening slots.  Compact the whole DP-local list
+// by atom index before turning it into graph edges.  The GPU-edge path is only
+// used when each periodic box thickness exceeds twice the neighbor cutoff, so
+// distinct periodic images of the same atom cannot be valid separate edges.
+static __global__ void dp_compact_duplicate_neighbors(
+  const int N,
+  const int nloc,
+  int* NN,
+  int* NL)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n1 < nloc) {
+    const int count = NN[n1];
+    int count_unique = 0;
+    for (int c = 0; c < count; ++c) {
+      const int n2 = NL[static_cast<size_t>(c) * N + n1];
+      bool duplicate = false;
+      for (int u = 0; u < count_unique; ++u) {
+        if (NL[static_cast<size_t>(u) * N + n1] == n2) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (!duplicate) {
+        NL[static_cast<size_t>(count_unique++) * N + n1] = n2;
+      }
+    }
+    NN[n1] = count_unique;
+  }
 }
+
+// Materialize the compact edge schema from GPUMD's neighbor list (NN, NL).
+// For each local atom n1 and each of its NN[n1] neighbors n2 (a local index),
+// emit one edge (src = n2, dst = n1) with the minimum-image bond vector
+// r(n2) - r(n1).  ``edge_index`` is the flattened [2, nedge] graph:
+// [0, nedge) holds the source row, [nedge, 2 * nedge) the destination row.
+static __global__ void dp_fill_edges(
+  const int N,
+  const int nloc,
+  const int* __restrict__ NN,
+  const int* __restrict__ NL,
+  const int* __restrict__ edge_offset,
+  const double* __restrict__ x,
+  const double* __restrict__ y,
+  const double* __restrict__ z,
+  const Box box,
+  const int nedge,
+  int* edge_index,
+  double* edge_vec)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n1 < nloc) {
+    const int count = NN[n1];
+    const int base = edge_offset[n1];
+    const double x1 = x[n1];
+    const double y1 = y[n1];
+    const double z1 = z[n1];
+    for (int c = 0; c < count; ++c) {
+      const int n2 = NL[c * N + n1];
+      double x12 = x[n2] - x1;
+      double y12 = y[n2] - y1;
+      double z12 = z[n2] - z1;
+      apply_mic(box, x12, y12, z12);
+      const int e = base + c;
+      edge_index[e] = n2;
+      edge_index[nedge + e] = n1;
+      edge_vec[e * 3] = x12;
+      edge_vec[e * 3 + 1] = y12;
+      edge_vec[e * 3 + 2] = z12;
+    }
+  }
+}
+
+// Build the compact canonical graph ABI used by compressed DPA4C artifacts.
+// The neighbor list is already destination-major (one contiguous row per
+// center), so its exclusive offsets are the destination CSR.  This kernel
+// writes the uint32 source row, float32 bond vectors, and per-source counts.
+static __global__ void dp_fill_canonical_edges(
+  const int N,
+  const int* __restrict__ NN,
+  const int* __restrict__ NL,
+  const int* __restrict__ edge_offset,
+  const double* __restrict__ x,
+  const double* __restrict__ y,
+  const double* __restrict__ z,
+  const Box box,
+  int* source,
+  float* edge_vec,
+  int* source_count)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n1 < N) {
+    const int count = NN[n1];
+    const int base = edge_offset[n1];
+    const double x1 = x[n1];
+    const double y1 = y[n1];
+    const double z1 = z[n1];
+    for (int c = 0; c < count; ++c) {
+      const int n2 = NL[static_cast<size_t>(c) * N + n1];
+      double x12 = x[n2] - x1;
+      double y12 = y[n2] - y1;
+      double z12 = z[n2] - z1;
+      apply_mic(box, x12, y12, z12);
+      const int edge = base + c;
+      source[edge] = n2;
+      edge_vec[edge * 3] = static_cast<float>(x12);
+      edge_vec[edge * 3 + 1] = static_cast<float>(y12);
+      edge_vec[edge * 3 + 2] = static_cast<float>(z12);
+      atomicAdd(source_count + n2, 1);
+    }
+  }
+}
+
+static __global__ void dp_prepare_canonical_nodes(
+  const int N,
+  const int nedge,
+  const int* __restrict__ type,
+  const int* __restrict__ destination_offset,
+  std::int64_t* model_type,
+  std::int64_t* destination_row_ptr)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n1 < N) {
+    model_type[n1] = static_cast<std::int64_t>(type[n1]);
+    destination_row_ptr[n1] =
+      static_cast<std::int64_t>(destination_offset[n1]);
+  }
+  if (n1 == N - 1) {
+    destination_row_ptr[N] = static_cast<std::int64_t>(nedge);
+  }
+}
+
+static __global__ void dp_prepare_canonical_source_rows(
+  const int N,
+  const int nedge,
+  const int* __restrict__ source_offset,
+  std::int64_t* source_row_ptr,
+  int* source_cursor)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n1 < N) {
+    const int offset = source_offset[n1];
+    source_row_ptr[n1] = static_cast<std::int64_t>(offset);
+    source_cursor[n1] = offset;
+  }
+  if (n1 == N - 1) {
+    source_row_ptr[N] = static_cast<std::int64_t>(nedge);
+  }
+}
+
+static __global__ void dp_build_canonical_source_order(
+  const int nedge,
+  const int* __restrict__ source,
+  int* source_cursor,
+  int* source_order)
+{
+  const int edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge < nedge) {
+    const int position = atomicAdd(source_cursor + source[edge], 1);
+    source_order[position] = edge;
+  }
+}
+
+static __global__ void dp_fill_canonical_guards(
+  const int edge_begin,
+  const int edge_storage,
+  int* source,
+  float* edge_vec,
+  int* source_order)
+{
+  const int edge = edge_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge < edge_storage) {
+    source[edge] = 0;
+    edge_vec[edge * 3] = 0.0f;
+    edge_vec[edge * 3 + 1] = 0.0f;
+    edge_vec[edge * 3 + 2] = 0.0f;
+    source_order[edge] = edge;
+  }
+}
+
+// Scatter the device model outputs into GPUMD's per-atom arrays.  Force and
+// virial are converted from the model's row-major layout to GPUMD's
+// structure-of-arrays layout, applying the unit-conversion factors.  The
+// virial index map mirrors the standalone path: model column-major
+// (xx, yx, zx, xy, yy, zy, xz, yz, zz) -> GPUMD (xx, yy, zz, xy, xz, yz, yx,
+// zx, zy).
+static __global__ void dp_scatter_outputs(
+  const int nloc,
+  const double* __restrict__ atom_energy,
+  const double* __restrict__ force_rm,
+  const double* __restrict__ atom_virial,
+  const double e_factor,
+  const double f_factor,
+  const double v_factor,
+  double* potential,
+  double* force,
+  double* virial)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n1 < nloc) {
+    potential[n1] = atom_energy[n1] * e_factor;
+
+    force[n1] = force_rm[n1 * 3] * f_factor;
+    force[n1 + nloc] = force_rm[n1 * 3 + 1] * f_factor;
+    force[n1 + nloc * 2] = force_rm[n1 * 3 + 2] * f_factor;
+
+    const double* v = atom_virial + n1 * 9;
+    virial[n1] = v[0] * v_factor;
+    virial[n1 + nloc] = v[4] * v_factor;
+    virial[n1 + nloc * 2] = v[8] * v_factor;
+    virial[n1 + nloc * 3] = v[3] * v_factor;
+    virial[n1 + nloc * 4] = v[6] * v_factor;
+    virial[n1 + nloc * 5] = v[7] * v_factor;
+    virial[n1 + nloc * 6] = v[1] * v_factor;
+    virial[n1 + nloc * 7] = v[2] * v_factor;
+    virial[n1 + nloc * 8] = v[5] * v_factor;
+  }
+}
+
+}
+
+void DP::compute_gpu_edges(
+  Box& box,
+  const GPU_Vector<int>& type,
+  const GPU_Vector<double>& position_per_atom,
+  GPU_Vector<double>& potential_per_atom,
+  GPU_Vector<double>& force_per_atom,
+  GPU_Vector<double>& virial_per_atom)
+{
+  const int N = type.size();
+  const int grid_size = (N - 1) / BLOCK_SIZE_FORCE + 1;
+
+  // The global list is (re)built at rc + skin only when an atom has drifted
+  // more than skin/2, then filtered to the true cutoff rc for this step's
+  // edges. The rebuild is amortized over many steps instead of running every
+  // step.
+  dp_neighbor.find_neighbor_global(rc, box, type, position_per_atom);
+  dp_neighbor.find_local_neighbor_from_global(
+    rc, box, position_per_atom, dp_NN_local, dp_NL_local);
+
+  // find_neighbor_global uses cells of width (rc + skin) / 2 and a five-cell
+  // stencil.  Wrapped cells can alias only when a periodic direction has
+  // fewer than five cells; avoid the quadratic compaction cost for the common
+  // non-aliasing case.  The 1.0 A skin must match Neighbor::skin.
+  int num_bins[3];
+  box.get_num_bins(0.5 * (rc + 1.0), num_bins);
+  const bool wrapped_cells_alias =
+    (box.pbc_x && num_bins[0] < 5) ||
+    (box.pbc_y && num_bins[1] < 5) ||
+    (box.pbc_z && num_bins[2] < 5);
+  if (wrapped_cells_alias) {
+    dp_compact_duplicate_neighbors<<<grid_size, BLOCK_SIZE_FORCE>>>(
+      N, N, dp_NN_local.data(), dp_NL_local.data());
+    GPU_CHECK_KERNEL
+  }
+
+  // Exclusive scan of the per-atom neighbor counts gives each atom's edge
+  // offset; the total edge count is the reduction of the counts.
+  dp_edge_offset.resize(N);
+  thrust::exclusive_scan(
+    thrust::device, dp_NN_local.data(), dp_NN_local.data() + N,
+    dp_edge_offset.data());
+  const int nedge = thrust::reduce(
+    thrust::device, dp_NN_local.data(), dp_NN_local.data() + N, 0,
+    thrust::plus<int>());
+
+  dp_atom_energy_gpu.resize(N);
+  dp_force_rowmajor.resize(N * 3);
+  dp_atom_virial_gpu.resize(N * 9);
+
+  if (deep_pot.uses_canonical_graph_inference()) {
+    // Reuse existing DP scratch buffers for the additional canonical ABI
+    // arrays. Their element widths match the required int64/uint32 storage,
+    // so no class-layout or neighbor implementation change is needed.
+    const int edge_storage = nedge < 2 ? 2 : nedge;
+    if (dp_edge_index.size() < static_cast<size_t>(2 * edge_storage)) {
+      dp_edge_index.resize(2 * edge_storage);
+    }
+    if (dp_edge_vec.size() < static_cast<size_t>(3 * edge_storage)) {
+      dp_edge_vec.resize(3 * edge_storage);
+    }
+    dp_position_gpu_trans.resize(N);  // int64 model type
+    dp_position_gpu.resize(N + 1);    // int64 destination row pointer
+    if (e_f_v_gpu.size() < static_cast<size_t>(N + 1)) {
+      e_f_v_gpu.resize(N + 1);        // int64 source row pointer
+    }
+    ghost_count.resize(N);            // uint32 source counts
+    ghost_sum.resize(N);              // uint32 source cursors
+
+    auto* model_type =
+      reinterpret_cast<std::int64_t*>(dp_position_gpu_trans.data());
+    auto* destination_row_ptr =
+      reinterpret_cast<std::int64_t*>(dp_position_gpu.data());
+    auto* source_row_ptr = reinterpret_cast<std::int64_t*>(e_f_v_gpu.data());
+    int* source = dp_edge_index.data();
+    int* source_order = dp_edge_index.data() + edge_storage;
+    float* edge_vec = reinterpret_cast<float*>(dp_edge_vec.data());
+
+    dp_prepare_canonical_nodes<<<grid_size, BLOCK_SIZE_FORCE>>>(
+      N, nedge, type.data(), dp_edge_offset.data(), model_type,
+      destination_row_ptr);
+    GPU_CHECK_KERNEL
+    CHECK(gpuMemset(ghost_count.data(), 0, sizeof(int) * N));
+    if (nedge > 0) {
+      dp_fill_canonical_edges<<<grid_size, BLOCK_SIZE_FORCE>>>(
+        N, dp_NN_local.data(), dp_NL_local.data(), dp_edge_offset.data(),
+        position_per_atom.data(), position_per_atom.data() + N,
+        position_per_atom.data() + N * 2, box, source, edge_vec,
+        ghost_count.data());
+      GPU_CHECK_KERNEL
+    }
+    thrust::exclusive_scan(
+      thrust::device, ghost_count.data(), ghost_count.data() + N,
+      dp_edge_offset.data());
+    dp_prepare_canonical_source_rows<<<grid_size, BLOCK_SIZE_FORCE>>>(
+      N, nedge, dp_edge_offset.data(), source_row_ptr, ghost_sum.data());
+    GPU_CHECK_KERNEL
+    if (nedge > 0) {
+      const int edge_grid = (nedge - 1) / BLOCK_SIZE_FORCE + 1;
+      dp_build_canonical_source_order<<<edge_grid, BLOCK_SIZE_FORCE>>>(
+        nedge, source, ghost_sum.data(), source_order);
+      GPU_CHECK_KERNEL
+    }
+    if (edge_storage > nedge) {
+      const int guard_grid =
+        (edge_storage - nedge - 1) / BLOCK_SIZE_FORCE + 1;
+      dp_fill_canonical_guards<<<guard_grid, BLOCK_SIZE_FORCE>>>(
+        nedge, edge_storage, source, edge_vec, source_order);
+      GPU_CHECK_KERNEL
+    }
+
+    deep_pot.compute_canonical_graph_gpu(
+      dp_atom_energy_gpu.data(), dp_force_rowmajor.data(),
+      dp_atom_virial_gpu.data(), model_type,
+      reinterpret_cast<std::uint32_t*>(source), edge_vec,
+      destination_row_ptr, source_row_ptr,
+      reinterpret_cast<std::uint32_t*>(source_order), N, N,
+      static_cast<std::int64_t>(edge_storage));
+  } else {
+    // Transpose positions from GPUMD SoA (x1..xN, y1..yN, z1..zN) to the
+    // row-major (x1, y1, z1, ...) layout the edge model consumes.
+    dp_position_gpu_trans.resize(N * 3);
+    dp_position_transpose<<<grid_size, BLOCK_SIZE_FORCE>>>(
+      position_per_atom.data(), dp_position_gpu_trans.data(), N);
+    GPU_CHECK_KERNEL
+    if (nedge > 0) {
+      if (dp_edge_index.size() < static_cast<size_t>(2 * nedge)) {
+        dp_edge_index.resize(2 * nedge);
+      }
+      if (dp_edge_vec.size() < static_cast<size_t>(3 * nedge)) {
+        dp_edge_vec.resize(3 * nedge);
+      }
+      dp_fill_edges<<<grid_size, BLOCK_SIZE_FORCE>>>(
+        N, N, dp_NN_local.data(), dp_NL_local.data(), dp_edge_offset.data(),
+        position_per_atom.data(), position_per_atom.data() + N,
+        position_per_atom.data() + N * 2, box, nedge, dp_edge_index.data(),
+        dp_edge_vec.data());
+      GPU_CHECK_KERNEL
+    }
+    deep_pot.compute_edges_gpu(
+      dp_atom_energy_gpu.data(), dp_force_rowmajor.data(),
+      dp_atom_virial_gpu.data(), dp_position_gpu_trans.data(), type.data(),
+      dp_edge_index.data(), dp_edge_vec.data(), N, nedge);
+  }
+
+  // Scatter the device outputs into GPUMD's per-atom arrays.
+  dp_scatter_outputs<<<grid_size, BLOCK_SIZE_FORCE>>>(
+    N, dp_atom_energy_gpu.data(), dp_force_rowmajor.data(),
+    dp_atom_virial_gpu.data(), ener_unit_cvt_factor, force_unit_cvt_factor,
+    virial_unit_cvt_factor, potential_per_atom.data(), force_per_atom.data(),
+    virial_per_atom.data());
+  GPU_CHECK_KERNEL
+}
+
 void DP::compute(
   Box& box,
   const GPU_Vector<int>& type,
@@ -532,9 +913,39 @@ void DP::compute(
   dp_nl.inum = number_of_atoms;
   int grid_size = (number_of_atoms - 1) / BLOCK_SIZE_FORCE + 1;
 
+  // Build the neighbor list and edge schema on the GPU and run the exported
+  // model on device tensors (no host neighbor-list build, no per-step
+  // host-device transfers).  This path resolves neighbors by the minimum-image
+  // convention, which is valid only when the cutoff is smaller than half the
+  // box thickness along every periodic direction.  Smaller cells
+  // (cutoff >= L/2) need the explicit ghost images built by the standalone
+  // path below, so fall back to it there.  Box thicknesses are computed
+  // directly because Box::thickness_* is only populated as a side effect of
+  // get_num_bins, which has not run yet at this point.
+  {
+    // The reused global list spans rc + skin, so the minimum-image build is
+    // only unambiguous when every periodic thickness exceeds 2 * (rc + skin);
+    // thinner cells fall back to the explicit-ghost path below. The skin here
+    // must match Neighbor::skin (1.0 A).
+    const double neighbor_rc = rc + 1.0;
+    const double volume = box.get_volume();
+    const double thickness_x = volume / box.get_area(0);
+    const double thickness_y = volume / box.get_area(1);
+    const double thickness_z = volume / box.get_area(2);
+    const bool mic_valid = (box.pbc_x == 0 || thickness_x > 2.0 * neighbor_rc) &&
+                           (box.pbc_y == 0 || thickness_y > 2.0 * neighbor_rc) &&
+                           (box.pbc_z == 0 || thickness_z > 2.0 * neighbor_rc);
+    if (mic_valid && deep_pot.supports_device_edge_inference()) {
+      compute_gpu_edges(
+        box, type, position_per_atom, potential_per_atom, force_per_atom,
+        virial_per_atom);
+      return;
+    }
+  }
+
   // Always use DeePMD's internal neighbor list construction (bypass path).
   // This avoids ghost atom construction which causes force inconsistency
-  // for message-passing networks (e.g. DPA2/DPA3) on both bulk and slab systems.
+  // for message-passing networks on both bulk and slab systems.
   //
   // For non-periodic directions, we inflate the box and center atoms so that
   // DeePMD's internal PBC won't create spurious periodic images in those directions.

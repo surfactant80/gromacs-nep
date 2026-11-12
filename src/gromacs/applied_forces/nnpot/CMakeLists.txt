@@ -87,39 +87,115 @@ else()
         # this GROMACS module.
         set(GPUMD_VENDOR_ROOT "${PROJECT_SOURCE_DIR}/src/external/gpumd")
         set(GPUMD_SOURCE_ROOT "${GPUMD_VENDOR_ROOT}/src")
-        if (NOT EXISTS "${GPUMD_VENDOR_ROOT}/LICENCE"
+        if (NOT EXISTS "${GPUMD_VENDOR_ROOT}/LICENSES"
             OR NOT EXISTS "${GPUMD_SOURCE_ROOT}/force/nep.cu")
             message(FATAL_ERROR
                 "GMX_NNPOT=NEP requires an unmodified GPUMD source tree at "
                 "${GPUMD_VENDOR_ROOT}.")
         endif()
 
-        set(GPUMD_NEP_VENDOR_CUDA_SOURCES
-            ${GPUMD_SOURCE_ROOT}/force/dftd3.cu
-            ${GPUMD_SOURCE_ROOT}/force/ewald.cu
+        # Only the sources needed for model loading and force evaluation are
+        # compiled into libgromacs; the GPUMD executables, training code and
+        # the replica-exchange/multi-GPU paths are intentionally left out.
+        #
+        # The list is validated below so that replacing src/external/gpumd with
+        # a newer GPUMD tree fails with an actionable message instead of an
+        # obscure missing-file error. Optional model families are detected from
+        # the tree so an upstream that adds or drops a family keeps building.
+        set(GPUMD_REQUIRED_FILES
             ${GPUMD_SOURCE_ROOT}/force/nep.cu
             ${GPUMD_SOURCE_ROOT}/force/nep_charge.cu
             ${GPUMD_SOURCE_ROOT}/force/neighbor.cu
             ${GPUMD_SOURCE_ROOT}/force/potential.cu
+            ${GPUMD_SOURCE_ROOT}/force/ewald.cu
             ${GPUMD_SOURCE_ROOT}/force/pppm.cu
+            ${GPUMD_SOURCE_ROOT}/force/dftd3.cu
             ${GPUMD_SOURCE_ROOT}/model/box.cu
-            ${GPUMD_SOURCE_ROOT}/utilities/error.cu
+            ${GPUMD_SOURCE_ROOT}/utilities/run_input.cu
             ${GPUMD_SOURCE_ROOT}/utilities/read_file.cu
+            ${GPUMD_SOURCE_ROOT}/utilities/error.cu
+            ${GPUMD_SOURCE_ROOT}/utilities/nep_file.cu
+            ${GPUMD_SOURCE_ROOT}/utilities/nep_model_file.cu
+            ${GPUMD_SOURCE_ROOT}/utilities/nep_model_input.cu
+            ${GPUMD_SOURCE_ROOT}/utilities/nep_spin_model_file.cu
+            ${GPUMD_SOURCE_ROOT}/force/nep.cuh
+            ${GPUMD_SOURCE_ROOT}/force/nep_charge.cuh
+            ${GPUMD_SOURCE_ROOT}/utilities/run_input.cuh
+            ${GPUMD_SOURCE_ROOT}/utilities/gpu_vector.cuh
         )
+        foreach(gpumd_file IN LISTS GPUMD_REQUIRED_FILES)
+            if (NOT EXISTS "${gpumd_file}")
+                message(FATAL_ERROR
+                    "The vendored GPUMD tree at ${GPUMD_VENDOR_ROOT} does not contain "
+                    "${gpumd_file}. The GROMACS NEP adapter expects the current GPUMD "
+                    "NEP API (NEP/NEP_Charge classes, RunInput, NEP_Model_File). "
+                    "Restore a compatible GPUMD master, or update the adapter and this "
+                    "file list. See docs/GPUMD-UPGRADE.md.")
+            endif()
+        endforeach()
+
+        set(GPUMD_NEP_VENDOR_CUDA_SOURCES
+            ${GPUMD_REQUIRED_FILES}
+        )
+        # Model readers are split into several translation units upstream; glob
+        # them so newly added readers are compiled automatically.
+        file(GLOB GPUMD_MODEL_READER_SOURCES
+            ${GPUMD_SOURCE_ROOT}/utilities/nep_model_file*.cu
+            ${GPUMD_SOURCE_ROOT}/utilities/compact_nep.cu)
+        list(APPEND GPUMD_NEP_VENDOR_CUDA_SOURCES ${GPUMD_MODEL_READER_SOURCES})
+
+        # Optional families: vdW NEP was added in GPUMD 2026. If a future tree
+        # drops it, the adapter reports a clear "not supported" error instead of
+        # failing to compile.
+        if (EXISTS "${GPUMD_SOURCE_ROOT}/force/nep_charge_vdw/nep_charge_vdw.cu")
+            list(APPEND GPUMD_NEP_VENDOR_CUDA_SOURCES
+                ${GPUMD_SOURCE_ROOT}/force/nep_charge_vdw/nep_charge_vdw.cu
+                ${GPUMD_SOURCE_ROOT}/force/nep_charge_vdw/pppm.cu)
+            set(GMX_NEP_HAVE_VDW ON)
+            target_compile_definitions(applied_forces INTERFACE GMX_NEP_HAVE_VDW=1)
+        else()
+            message(STATUS "Vendored GPUMD has no vdW NEP sources; vdW models will be rejected.")
+        endif()
+
         set_property(GLOBAL APPEND PROPERTY
             GMX_GPUMD_NEP_VENDOR_CUDA_SOURCES
             ${GPUMD_NEP_VENDOR_CUDA_SOURCES})
 
         gmx_add_libgromacs_sources(
             nnpotforceprovider.cpp
+            nepbackendsettings.cpp
+            nepmodelinfo.cpp
             nepmodel.cu
             nepmodel_qnep_gromacs.cu
+            wpeloader.cpp
+            wpepotential.cu
             ${GPUMD_NEP_VENDOR_CUDA_SOURCES}
         )
         target_compile_definitions(applied_forces INTERFACE GMX_NEP=1)
         target_include_directories(applied_forces INTERFACE
             ${GPUMD_SOURCE_ROOT})
-        target_link_libraries(applied_forces INTERFACE CUDA::cudart)
+        target_link_libraries(applied_forces INTERFACE CUDA::cudart CUDA::cufft)
+
+        if (GMX_NEP_WPE)
+            if (WIN32)
+                message(FATAL_ERROR
+                    "GMX_NEP_WPE uses dlopen()/RPATH discovery and is supported on "
+                    "Linux only.")
+            endif()
+            target_compile_definitions(applied_forces INTERFACE GMX_NEP_WPE=1)
+            target_include_directories(applied_forces INTERFACE
+                ${PROJECT_SOURCE_DIR}/src/external/wpe)
+            if (GMX_WPE_LIBRARY)
+                if (NOT EXISTS "${GMX_WPE_LIBRARY}")
+                    message(FATAL_ERROR
+                        "GMX_WPE_LIBRARY does not exist: ${GMX_WPE_LIBRARY}")
+                endif()
+                message(STATUS "WPE backend enabled; runtime library hint: ${GMX_WPE_LIBRARY}")
+            else()
+                message(STATUS
+                    "WPE backend enabled; libwisevolve_potential.so is located at run time")
+            endif()
+        endif()
     else()
         gmx_add_libgromacs_sources(
             nnpotforceprovider_stub.cpp

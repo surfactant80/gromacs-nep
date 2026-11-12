@@ -58,6 +58,7 @@
 #include "gromacs/utility/vectypes.h"
 
 struct gmx_domdec_t;
+class DeviceStream;
 struct gmx_enerdata_t;
 struct gmx_wallcycle;
 struct t_forcerec;
@@ -136,6 +137,9 @@ public:
     const gmx_domdec_t*  dd_;      //!< Domain decomposition object, deprecated
     DeviceBuffer<RVec>   deviceCoordinates_; //!< Optional GROMACS device coordinates
     GpuEventSynchronizer* deviceCoordinatesReady_; //!< Readiness event for device coordinates
+    //! Stream on which a device force provider must enqueue its work so the
+    //! following GPU force reduction is correctly ordered (may be null).
+    const DeviceStream* deviceStream_ = nullptr;
 
     //! Electrostatics interaction constants (ewaldCoeff, ewaldShift, epsfac, cutoffs),
     //! or nullptr when not available.
@@ -222,6 +226,13 @@ public:
 
     //! Device force buffer produced by the most recent calculateForces call.
     virtual DeviceBuffer<RVec> deviceForceBuffer() const { return {}; }
+
+    /*! rief Block until this provider's device forces are ready.
+     *
+     * Only needed on code paths that read the device force buffer on the host
+     * instead of consuming it through the GPU force reduction.
+     */
+    virtual void waitForDeviceForces() const {}
 
     /*! \brief
      * Whether the device force buffer currently covers the local atoms.
@@ -314,6 +325,9 @@ public:
 
     //! Whether the device force buffer covers the local atoms for this step.
     bool deviceForcesValidForCurrentStep() const;
+
+    //! Block until all device forces produced by the providers are ready.
+    void waitForDeviceForces() const;
 
     //! Whether any registered provider updates the atomic charges every step.
     bool haveDynamicCharges() const;

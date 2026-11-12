@@ -69,6 +69,8 @@
 #endif
 #include "gromacs/gmxlib/network.h"
 #include "gromacs/gmxlib/nrnb.h"
+#include "gromacs/gpu_utils/device_stream.h"
+#include "gromacs/gpu_utils/device_stream_manager.h"
 #include "gromacs/gpu_utils/devicebuffer_datatype.h"
 #include "gromacs/gpu_utils/gpu_utils.h"
 #include "gromacs/imd/imd.h"
@@ -685,6 +687,14 @@ static void computeSpecialForces(FILE*                fplog,
         forceProviderInput.ic_            = fr->ic.get();
         forceProviderInput.computeEnergy  = stepWork.computeEnergy;
         forceProviderInput.computeVirial  = stepWork.computeVirial;
+        // Device force providers enqueue on the same stream as the subsequent
+        // GPU force reduction, so no per-step host synchronization is needed.
+        if (domainWork.haveDeviceForceProviders && fr->deviceStreamManager != nullptr
+            && fr->deviceStreamManager->streamIsValid(DeviceStreamType::NonBondedLocal))
+        {
+            forceProviderInput.deviceStream_ =
+                    &fr->deviceStreamManager->stream(DeviceStreamType::NonBondedLocal);
+        }
         if (stepWork.haveGpuPmeOnThisRank)
         {
             forceProviderInput.coulombPotential_ = pme_gpu_get_device_potential(fr->pmedata);
@@ -1870,6 +1880,24 @@ void do_force(FILE*                         fplog,
     }
 
 
+    const bool haveGpuNonbondedOrBondedWork =
+            simulationWork.useGpuNonbonded
+            && (stepWork.computeNonbondedForces || domainWork.haveGpuBondedWork);
+
+    if (haveGpuNonbondedOrBondedWork)
+    {
+        // Ensure local and non-local compute kernels will have
+        // the necessary shift vectors on the GPUs in time.
+        wallcycle_start_nocount(wcycle, WallCycleCounter::LaunchGpuPp);
+        wallcycle_sub_start_nocount(wcycle, WallCycleSubCounter::LaunchGpuNonBonded);
+        gpu_upload_shiftvec(nbv->gpuNbv(), &nbv->nbat());
+        wallcycle_sub_stop(wcycle, WallCycleSubCounter::LaunchGpuNonBonded);
+        wallcycle_stop(wcycle, WallCycleCounter::LaunchGpuPp);
+    }
+
+    /* Coordinate conversion acts as a synchronization point between local and non-local
+     * streams. All "misc" operations which are needed by both local and non-local
+     * NBNXM kernels must be submitted before. */
     if (!stepWork.doNeighborSearch && !EI_TPI(inputrec.eI) && stepWork.computeNonbondedForces)
     {
         if (stepWork.useGpuXBufferOps)
@@ -1890,13 +1918,17 @@ void do_force(FILE*                         fplog,
         }
     }
 
-    if (simulationWork.useGpuNonbonded && (stepWork.computeNonbondedForces || domainWork.haveGpuBondedWork))
+    if (haveDDAtomOrdering(*cr))
+    {
+        dd_force_flop_start(cr->dd, nrnb);
+    }
+
+    if (haveGpuNonbondedOrBondedWork)
     {
         ddBalanceRegionHandler.openBeforeForceComputationGpu();
 
         wallcycle_start(wcycle, WallCycleCounter::LaunchGpuPp);
         wallcycle_sub_start(wcycle, WallCycleSubCounter::LaunchGpuNonBonded);
-        gpu_upload_shiftvec(nbv->gpuNbv(), &nbv->nbat());
         if (!stepWork.useGpuXBufferOps)
         {
             gpu_copy_xq_to_gpu(nbv->gpuNbv(), &nbv->nbat(), AtomLocality::Local);
@@ -2167,7 +2199,6 @@ void do_force(FILE*                         fplog,
     if (haveDDAtomOrdering(*cr) && simulationWork.haveSeparatePmeRank)
     {
         wallcycle_start(wcycle, WallCycleCounter::PpDuringPme);
-        dd_force_flop_start(cr->dd, nrnb);
     }
 
     if (inputrec.bRot)
@@ -2607,6 +2638,7 @@ void do_force(FILE*                         fplog,
                                "are only supported without domain decomposition.");
             const int numAtoms = nbv->getNumAtoms(AtomLocality::Local);
             std::vector<RVec> providerForces(numAtoms);
+            fr->forceProviders->waitForDeviceForces();
             cudaMemcpy(providerForces.data(),
                        deviceForce,
                        numAtoms * sizeof(RVec),

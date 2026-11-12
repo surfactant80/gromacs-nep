@@ -181,9 +181,12 @@ static __global__ void find_descriptor_gmx(
                 float gn12 = 0.0f;
                 for (int k = 0; k <= paramb.basis_size_radial; ++k)
                 {
-                    int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
-                    c_index += t1 * paramb.num_types + t2;
-                    gn12 += fn12[k] * annmb.c[c_index];
+                    const int c_index = get_c_index(t1 * paramb.num_types + t2,
+                                                    n,
+                                                    k,
+                                                    paramb.n_max_radial,
+                                                    paramb.basis_size_radial);
+                    gn12 += fn12[k] * annmb.c_type_pair[c_index];
                 }
                 q[n] += gn12;
             }
@@ -211,9 +214,13 @@ static __global__ void find_descriptor_gmx(
                 float gn12 = 0.0f;
                 for (int k = 0; k <= paramb.basis_size_angular; ++k)
                 {
-                    int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
-                    c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
-                    gn12 += fn12[k] * annmb.c[c_index];
+                    const int c_index = get_c_index(t1 * paramb.num_types + t2,
+                                                    n,
+                                                    k,
+                                                    paramb.n_max_angular,
+                                                    paramb.basis_size_angular,
+                                                    paramb.num_c_radial);
+                    gn12 += fn12[k] * annmb.c_type_pair[c_index];
                 }
                 accumulate_s(paramb.L_max, d12, x12, y12, z12, gn12, s);
             }
@@ -478,9 +485,18 @@ static __global__ void find_force_radial_gmx(
                 float gnp21 = 0.0f;
                 for (int k = 0; k <= paramb.basis_size_radial; ++k)
                 {
-                    int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
-                    gnp12 += fnp12[k] * annmb.c[c_index + t1 * paramb.num_types + t2];
-                    gnp21 += fnp12[k] * annmb.c[c_index + t2 * paramb.num_types + t1];
+                    const int c_index_12 = get_c_index(t1 * paramb.num_types + t2,
+                                                       n,
+                                                       k,
+                                                       paramb.n_max_radial,
+                                                       paramb.basis_size_radial);
+                    const int c_index_21 = get_c_index(t2 * paramb.num_types + t1,
+                                                       n,
+                                                       k,
+                                                       paramb.n_max_radial,
+                                                       paramb.basis_size_radial);
+                    gnp12 += fnp12[k] * annmb.c_type_pair[c_index_12];
+                    gnp21 += fnp12[k] * annmb.c_type_pair[c_index_21];
                 }
                 float tmp12 = g_Fp[n1 + n * N] + g_charge_derivative[n1 + n * N] * g_D_real[n1];
                 float tmp21 = g_Fp[n2 + n * N] + g_charge_derivative[n2 + n * N] * g_D_real[n2];
@@ -595,10 +611,14 @@ static __global__ void find_partial_force_angular_gmx(
                 float gnp12 = 0.0f;
                 for (int k = 0; k <= paramb.basis_size_angular; ++k)
                 {
-                    int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
-                    c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
-                    gn12 += fn12[k] * annmb.c[c_index];
-                    gnp12 += fnp12[k] * annmb.c[c_index];
+                    const int c_index = get_c_index(t1 * paramb.num_types + t2,
+                                                    n,
+                                                    k,
+                                                    paramb.n_max_angular,
+                                                    paramb.basis_size_angular,
+                                                    paramb.num_c_radial);
+                    gn12 += fn12[k] * annmb.c_type_pair[c_index];
+                    gnp12 += fnp12[k] * annmb.c_type_pair[c_index];
                 }
                 accumulate_f12(paramb.L_max,
                                paramb.has_q_222,
@@ -764,14 +784,12 @@ public:
         // with skin = 1 A, and the sort kernel uses one block of MN threads,
         // so MN must stay below 1024.
         const int numNeighbors = 600;
-        model_->neighbor.initialize(rcCoulombA, numAtoms, numNeighbors);
+        model_->neighbor_manager.initialize(rcCoulombA, numAtoms, numNeighbors);
     }
 
     NEP_Charge* model_;
     int         chargeMode_;
     float       rcCoulombA_;
-    bool        useCachedSearch_ = false;
-    bool        searchModeSet_   = false;
 };
 
 NepQnepGromacs::NepQnepGromacs(NEP_Charge* model, int chargeMode, float rcCoulombA, int numAtoms) :
@@ -793,38 +811,17 @@ void NepQnepGromacs::predictCharges(Box&                      box,
     const int   N2       = model->N2;
     const int   gridSize = (N2 - N1 - 1) / c_blockSize + 1;
 
-    // Decide once whether the box is large enough for the cached search
-    // (search radius = rcoulomb + 1 A skin, five cells required).
-    if (!impl_->searchModeSet_)
-    {
-        const double volume = box.get_volume();
-        const double thicknessX = volume / box.get_area(0);
-        const double thicknessY = volume / box.get_area(1);
-        const double thicknessZ = volume / box.get_area(2);
-        const double minThickness = std::min({ thicknessX, thicknessY, thicknessZ });
-        impl_->useCachedSearch_ = minThickness >= 2.5 * (impl_->rcCoulombA_ + 1.0);
-        impl_->searchModeSet_ = true;
-    }
-
     // 1) Global neighbor list. GPUMD's Neighbor searches at rc + skin with
     // skin = 1 A and rebuilds automatically when any atom has moved more than
     // 0.5 A, so the list is reused across steps. The cell-list search needs at
     // least five cells per periodic direction (box >= 2.5 * search radius);
     // for smaller boxes the list is rebuilt every step at the exact Coulomb
     // cutoff instead.
-    if (impl_->useCachedSearch_)
-    {
-        model->neighbor.find_neighbor_global(impl_->rcCoulombA_, box, types, positions);
-    }
-    else
-    {
-        // Force the rebuild every step (bypass GPUMD's internal caching) and
-        // compensate the internal +skin so the actual search radius equals the
-        // Coulomb cutoff.
-        model->neighbor.x0.resize(0);
-        model->neighbor.find_neighbor_global(
-                static_cast<double>(impl_->rcCoulombA_) - 1.0, box, types, positions);
-    }
+    // The current GPUMD NeighborManager caches the list by displacement and
+    // its cell-offset range handles boxes with fewer than five cells per
+    // direction, so a single update() call covers both the cached and the
+    // small-box cases.
+    model->neighbor_manager.update(box, types, positions);
 
     // 2) Filter the radial and angular neighbor lists (always, so the
     // descriptor lists follow the current positions even with a reused global
@@ -839,8 +836,8 @@ void NepQnepGromacs::predictCharges(Box&                      box,
             positions.data(),
             positions.data() + N,
             positions.data() + N * 2,
-            model->neighbor.NN.data(),
-            model->neighbor.NL.data(),
+            model->neighbor_manager.get_candidate_NN().data(),
+            model->neighbor_manager.get_candidate_NL().data(),
             model->nep_data.NN_radial.data(),
             model->nep_data.NL_radial.data(),
             model->nep_data.NN_angular.data(),
@@ -851,7 +848,10 @@ void NepQnepGromacs::predictCharges(Box&                      box,
     {
         CHECK(cudaDeviceSynchronize());
         std::vector<int> nn(N);
-        model->neighbor.NN.copy_to_host(nn.data());
+        CHECK(cudaMemcpy(nn.data(),
+                         model->neighbor_manager.get_candidate_NN().data(),
+                         N * sizeof(int),
+                         cudaMemcpyDeviceToHost));
         std::vector<int> nnr(N);
         model->nep_data.NN_radial.copy_to_host(nnr.data());
         std::vector<int> nl(N * model->paramb.MN_radial);
@@ -922,8 +922,8 @@ void NepQnepGromacs::computeForces(Box&                      box,
     fill_d_real_gmx<<<(N + c_blockSize - 1) / c_blockSize, c_blockSize>>>(
             N,
             d_pmePotential,
-            model->neighbor.NN.data(),
-            model->neighbor.NL.data(),
+            model->neighbor_manager.get_candidate_NN().data(),
+            model->neighbor_manager.get_candidate_NL().data(),
             model->nep_data.charge.data(),
             positions.data(),
             positions.data() + N,
@@ -1020,7 +1020,6 @@ void NepQnepGromacs::computeForces(Box&                      box,
                                      model->nep_data.f12x.data(),
                                      model->nep_data.f12y.data(),
                                      model->nep_data.f12z.data(),
-                                     false,
                                      positions,
                                      forces,
                                      virial);

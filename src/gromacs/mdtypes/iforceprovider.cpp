@@ -98,6 +98,14 @@ DeviceBuffer<RVec> ForceProviders::deviceForceBuffer() const
     return impl_->providers_.front().first->deviceForceBuffer();
 }
 
+void ForceProviders::waitForDeviceForces() const
+{
+    for (const auto& provider : impl_->providers_)
+    {
+        provider.first->waitForDeviceForces();
+    }
+}
+
 bool ForceProviders::deviceForcesValidForCurrentStep() const
 {
     if (!allForceProvidersSupportDeviceForces() || impl_->providers_.size() != 1)

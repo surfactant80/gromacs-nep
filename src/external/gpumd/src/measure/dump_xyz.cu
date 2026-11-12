@@ -2,15 +2,15 @@
     Copyright 2017 Zheyong Fan and GPUMD development team
     This file is part of GPUMD.
     GPUMD is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
+    it under the terms of the GNU Lesser General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
     GPUMD is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-    You should have received a copy of the GNU General Public License
-    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+    GNU Lesser General Public License for more details.
+    You should have received a copy of the GNU Lesser General Public License
+    along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 /*-----------------------------------------------------------------------------------------------100
@@ -52,41 +52,47 @@ static __global__ void gpu_sum(const int N, const double* g_data, double* g_data
   }
 }
 
-Dump_XYZ::Dump_XYZ(const char** param, int num_param, const std::vector<Group>& groups, Atom& atom)
+Dump_XYZ::Dump_XYZ(
+  const std::vector<std::string>& tokens,
+  const std::vector<Group>& groups,
+  Atom& atom,
+  bool is_nep_charge_input)
 {
-  is_nep_charge = check_is_nep_charge();
+  is_nep_charge = is_nep_charge_input;
 
-  parse(param, num_param, groups);
-  if (atom.unwrapped_position.size() < atom.number_of_atoms * 3) {
-    atom.unwrapped_position.resize(atom.number_of_atoms * 3);
-    atom.unwrapped_position.copy_from_device(atom.position_per_atom.data());
+  parse(tokens, groups);
+
+  if (quantities.has_unwrapped_position_) {
+    atom.enable_unwrapped_position();
   }
-  if (atom.position_temp.size() < atom.number_of_atoms * 3) {
-    atom.position_temp.resize(atom.number_of_atoms * 3);
-  }
-  property_name = "dump_xyz";
+
+  action_name = "dump_xyz";
 }
 
-void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>& groups)
+void Dump_XYZ::parse(
+  const std::vector<std::string>& tokens, const std::vector<Group>& groups)
 {
+  const int num_param = tokens.size();
   printf("Dump extended XYZ.\n");
 
   if (num_param < 3) {
     PRINT_INPUT_ERROR("dump_xyz should have at least 2 parameters.\n");
   }
 
-  // The old syntax started with <grouping_method> <group_id> <interval>, so param[2] and param[3]
-  // were both integers. In the current syntax param[2] is the file name and param[3] is an option
-  // or a quantity keyword, neither of which is an integer.
+  // The old syntax started with <grouping_method> <group_id> <interval>, so tokens[2] and
+  // tokens[3] were both integers. In the current syntax tokens[2] is the file name and tokens[3]
+  // is an option or a quantity keyword, neither of which is an integer.
   int scratch;
-  if (num_param >= 4 && is_valid_int(param[2], &scratch) && is_valid_int(param[3], &scratch)) {
+  if (
+    num_param >= 4 && is_valid_int(tokens[2], &scratch) &&
+    is_valid_int(tokens[3], &scratch)) {
     PRINT_INPUT_ERROR(
       "dump_xyz no longer takes <grouping_method> <group_id> as its first two "
       "parameters. Use dump_xyz <interval> <filename> [group <grouping_method> "
       "<group_id>] instead.");
   }
 
-  if (!is_valid_int(param[1], &dump_interval_)) {
+  if (!is_valid_int(tokens[1], &dump_interval_)) {
     PRINT_INPUT_ERROR("dump interval should be an integer.");
   }
   if (dump_interval_ <= 0) {
@@ -96,7 +102,7 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
   }
 
   // filename
-  std::string filename_temp = param[2];
+  std::string filename_temp = tokens[2];
   printf("    into file %s.\n", filename_temp.c_str());
   if (filename_temp.back() == '*') {
     separated_ = 1;
@@ -108,9 +114,19 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
 
   bool group_seen = false;
   bool precision_seen = false;
+  bool split_seen = false;
 
   for (int m = 3; m < num_param; ++m) {
-    if (strcmp(param[m], "group") == 0) {
+    if (tokens[m] == "spin") {
+      has_spin_ = true;
+      continue;
+    }
+    if (tokens[m] == "mforce") {
+      has_mforce_ = true;
+      continue;
+    }
+
+    if (tokens[m] == "group") {
       if (group_seen) {
         PRINT_INPUT_ERROR("Option 'group' is specified more than once in dump_xyz.\n");
       }
@@ -118,68 +134,44 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
       // what it is called now rather than only complaining about the missing arguments.
       int probe;
       if (
-        m + 2 >= num_param || !is_valid_int(param[m + 1], &probe) ||
-        !is_valid_int(param[m + 2], &probe)) {
+        m + 2 >= num_param || !is_valid_int(tokens[m + 1], &probe) ||
+        !is_valid_int(tokens[m + 2], &probe)) {
         PRINT_INPUT_ERROR(
           "Option 'group' should be followed by a grouping method and a group ID. The quantity "
           "that writes group labels as a column is now called 'group_labels'.");
       }
-      parse_group(param, num_param, false, groups, m, grouping_method_, group_id_);
+      parse_group(tokens, false, groups, m, grouping_method_, group_id_);
       group_seen = true;
       continue;
     }
-    if (strcmp(param[m], "precision") == 0) {
+    if (tokens[m] == "precision") {
       if (precision_seen) {
         PRINT_INPUT_ERROR("Option 'precision' is specified more than once in dump_xyz.\n");
       }
-      parse_precision(param, num_param, m, precision_);
+      parse_precision(tokens, m, precision_);
       precision_seen = true;
       continue;
     }
-    if (strcmp(param[m], "velocity") == 0) {
-      quantities.has_velocity_ = true;
-      printf("    has velocity.\n");
-    } else if (strcmp(param[m], "force") == 0) {
-      quantities.has_force_ = true;
-      printf("    has force.\n");
-    } else if (strcmp(param[m], "potential") == 0) {
-      quantities.has_potential_ = true;
-      printf("    has potential.\n");
-    } else if (strcmp(param[m], "unwrapped_position") == 0) {
-      quantities.has_unwrapped_position_ = true;
-      printf("    has unwrapped position.\n");
-    } else if (strcmp(param[m], "mass") == 0) {
-      quantities.has_mass_ = true;
-      printf("    has mass.\n");
-    } else if (strcmp(param[m], "charge") == 0) {
-      quantities.has_charge_ = true;
-      if (is_nep_charge) {
-        printf("    has charge predicted by NEP-charge.\n");
-      } else {
-        printf("    has charge specified in model.xyz.\n");
+    if (tokens[m] == "split") {
+      if (split_seen) {
+        PRINT_INPUT_ERROR("Option 'split' is specified more than once in dump_xyz.\n");
       }
-    } else if (strcmp(param[m], "bec") == 0) {
-      quantities.has_bec_ = true;
-      if (is_nep_charge) {
-        printf("    has BEC predicted by NEP-charge.\n");
-      } else {
-        PRINT_INPUT_ERROR("Cannot output BEC for a non-NEP-charge model.\n");
+      if (m + 1 >= num_param || !is_valid_int(tokens[m + 1], &split_frames_) ||
+          split_frames_ <= 0) {
+        PRINT_INPUT_ERROR("Option 'split' requires a positive number of frames.\n");
       }
-    } else if (strcmp(param[m], "virial") == 0) {
-      quantities.has_virial_ = true;
-      printf("    has virial.\n");
-    } else if (strcmp(param[m], "group_labels") == 0) {
-      // One column is written per grouping method, so with none the Properties field would say
-      // group:I:0, which is not readable as extended XYZ.
-      if (groups.size() == 0) {
-        PRINT_INPUT_ERROR(
-          "Cannot output group labels without a grouping method defined in model.xyz.\n");
-      }
-      quantities.has_group_ = true;
-      printf("    has group labels.\n");
-    } else {
+      ++m;
+      split_seen = true;
+      printf("    split every %d frames.\n", split_frames_);
+      continue;
+    }
+    if (!parse_dump_quantity(tokens[m], quantities, is_nep_charge, groups, "dump_xyz")) {
       PRINT_INPUT_ERROR("Unrecognized argument in dump_xyz.\n");
     }
+  }
+
+  if (split_frames_ > 0 && separated_) {
+    PRINT_INPUT_ERROR("Option 'split' cannot be combined with a filename ending in '*'.\n");
   }
 
   if (grouping_method_ < 0) {
@@ -187,7 +179,7 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
   }
 }
 
-void Dump_XYZ::preprocess(
+void Dump_XYZ::pre_run(
   const int number_of_steps,
   const double time_step,
   Integrate& integrate,
@@ -196,7 +188,10 @@ void Dump_XYZ::preprocess(
   Box& box,
   Force& force)
 {
-  if (separated_ == 0) {
+  if (split_frames_ > 0) {
+    splitter_.reset(filename_, split_frames_);
+    fid_ = nullptr;
+  } else if (separated_ == 0) {
     fid_ = my_fopen(filename_.c_str(), "a");
   }
 
@@ -209,6 +204,18 @@ void Dump_XYZ::preprocess(
   if (quantities.has_force_) {
     cpu_force_per_atom_.resize(atom.number_of_atoms * 3);
   }
+  if ((has_spin_ || has_mforce_) &&
+      !atom.has_spin) {
+    PRINT_INPUT_ERROR("dump_xyz spin/mforce require a NEP-spin model and spin:R:3 in model.xyz.");
+  }
+
+  if (has_spin_) {
+    cpu_spin_per_atom_.resize(atom.number_of_atoms * 3);
+  }
+  if (has_mforce_) {
+    cpu_mforce_per_atom_.resize(atom.number_of_atoms * 3);
+  }
+
   if (quantities.has_potential_) {
     cpu_potential_per_atom_.resize(atom.number_of_atoms);
   }
@@ -315,6 +322,13 @@ void Dump_XYZ::output_line2(
   if (quantities.has_force_) {
     fprintf(fid_, ":forces:R:3");
   }
+  if (has_spin_) {
+    fprintf(fid_, ":spin:R:3");
+  }
+  if (has_mforce_) {
+    fprintf(fid_, ":mforce:R:3");
+  }
+
   if (quantities.has_potential_) {
     fprintf(fid_, ":energy_atom:R:1");
   }
@@ -333,7 +347,7 @@ void Dump_XYZ::output_line2(
   fprintf(fid_, "\n");
 }
 
-void Dump_XYZ::process(
+void Dump_XYZ::end_of_step(
   const int number_of_steps,
   int step,
   const int fixed_group,
@@ -361,14 +375,14 @@ void Dump_XYZ::process(
   }
   if (quantities.has_charge_) {
     if (is_nep_charge) {
-      GPU_Vector<float>& nep_charge = force.potentials[0]->get_charge_reference();
+      GPU_Vector<float>& nep_charge = force.get_potential(0).get_charge_reference();
       nep_charge.copy_to_host(atom.cpu_charge.data());
     } else {
       atom.charge.copy_to_host(atom.cpu_charge.data());
     }
   }
   if (quantities.has_bec_) {
-    GPU_Vector<float>& gpu_bec = force.potentials[0]->get_bec_reference();
+    GPU_Vector<float>& gpu_bec = force.get_potential(0).get_bec_reference();
     gpu_bec.copy_to_host(cpu_bec_.data());
   }
   if (quantities.has_velocity_) {
@@ -377,6 +391,13 @@ void Dump_XYZ::process(
   if (quantities.has_force_) {
     atom.force_per_atom.copy_to_host(cpu_force_per_atom_.data());
   }
+  if (has_spin_) {
+    atom.spin_per_atom.copy_to_host(cpu_spin_per_atom_.data());
+  }
+  if (has_mforce_) {
+    atom.mforce_per_atom.copy_to_host(cpu_mforce_per_atom_.data());
+  }
+
   if (quantities.has_potential_) {
     atom.potential_per_atom.copy_to_host(cpu_potential_per_atom_.data());
   }
@@ -390,6 +411,12 @@ void Dump_XYZ::process(
   if (separated_) {
     std::string filename = filename_ + std::to_string(step + 1);
     fid_ = my_fopen(filename.data(), "w");
+  } else if (split_frames_ > 0 && splitter_.needs_new_file()) {
+    if (fid_ != nullptr) {
+      fclose(fid_);
+    }
+    const std::string filename = splitter_.next_filename();
+    fid_ = my_fopen(filename.c_str(), "w");
   }
 
   // line 1
@@ -436,6 +463,17 @@ void Dump_XYZ::process(
         fprintf(fid_, fmt_.c_str(), cpu_force_per_atom_[m + atom.number_of_atoms * d]);
       }
     }
+    if (has_spin_) {
+      for (int d = 0; d < 3; ++d) {
+        fprintf(fid_, fmt_.c_str(), cpu_spin_per_atom_[m + atom.number_of_atoms * d]);
+      }
+    }
+    if (has_mforce_) {
+      for (int d = 0; d < 3; ++d) {
+        fprintf(fid_, fmt_.c_str(), cpu_mforce_per_atom_[m + atom.number_of_atoms * d]);
+      }
+    }
+
     if (quantities.has_potential_) {
       fprintf(fid_, fmt_.c_str(), cpu_potential_per_atom_[m]);
     }
@@ -457,14 +495,17 @@ void Dump_XYZ::process(
     }
     fprintf(fid_, "\n");
   }
-  if (separated_ == 0) {
-    fflush(fid_);
-  } else {
+  if (separated_) {
     fclose(fid_);
+  } else {
+    fflush(fid_);
+    if (split_frames_ > 0) {
+      splitter_.frame_written();
+    }
   }
 }
 
-void Dump_XYZ::postprocess(
+void Dump_XYZ::post_run(
   Atom& atom,
   Box& box,
   Integrate& integrate,
@@ -472,7 +513,8 @@ void Dump_XYZ::postprocess(
   const double time_step,
   const double temperature)
 {
-  if (separated_ == 0) {
+  if (separated_ == 0 && fid_ != nullptr) {
     fclose(fid_);
+    fid_ = nullptr;
   }
 }

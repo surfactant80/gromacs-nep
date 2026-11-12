@@ -1,0 +1,210 @@
+
+GROMACS 2026.4 release notes
+----------------------------
+
+This version was released on October 2nd, 2026. These release notes
+document the changes that have taken place in |Gromacs| since the
+previous 2026.3 version, to fix known issues. It also incorporates all
+fixes made in version 2025.5 and earlier, which you can find described
+in the :ref:`release-notes`.
+
+.. Note to developers!
+   Please use """"""" to underline the individual entries for fixed issues in the subfolders,
+   otherwise the formatting on the webpage is messed up.
+   Also, please use the syntax :issue:`number` to reference issues on GitLab, without
+   a space between the colon and number!
+
+Fixes where mdrun could behave incorrectly
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Fix PME heap buffer overflow with multiple PME ranks
+""""""""""""""""""""""""""""""""""""""""""""""""""""
+When the local PME grid required SIMD padding in the z dimension,
+major-dimension overlap communication could write beyond its communication
+buffer. This could corrupt memory or crash ``mdrun`` when PME used multiple
+PME ranks, most readily with ``pme-order = 5``.
+
+:issue:`5669`
+
+Fixed MPI-parallel ``mdrun -plumed`` aborting at startup
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+Any MPI-parallel run using PLUMED aborted at startup with ``MPI_ERR_COMM``:
+PLUMED reads the ``setMPIComm`` argument as a pointer, but the communicator
+was passed by value. Only 2026 was affected.
+
+:issue:`5671`
+
+Worked around SYCL miscompilation in PME by oneAPI 2026.x
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+With all oneAPI versions 2026.x (and until a fix arrives), the SYCL
+PME GPU gather kernel on sufficiently large systems is affected by a
+miscompilation that causes a crash. Earlier oneAPI versions are not
+affected. Results are correct if mdrun does not crash.
+
+The issue is now worked around by always allocating some per-workgroup
+shared local memory, which can be more than is strictly required, but
+which is unlikely to affect performance noticeably.
+
+:issue:`5688`
+
+Fixed incorrect forces with (experimental) non-bonded free-energy on GPU with sc-power=2
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+:issue:`5693`
+
+ 
+Removed incorrect load imbalance reporting with halo communication on GPU
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+When halo communication is offloaded to the GPU, load imbalance cannot be
+measured via host timers and the reported imbalance values were meaningless.
+
+
+:issue:`5700`
+
+PME and Ewald with 3DC correction or finite epsilon surface now add virial contribution
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The contribution to the virial was missing for these cases. This contribution is nearly
+always very small.
+
+:issue:`5694`
+
+Fixed freeze when using NVSHMEM with PME decomposition
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+When NVSHMEM was used with multiple PME ranks, and ``-ddorder interleave`` was used,
+the simulation would deadlock on the first step.
+
+:issue:`5641`
+
+Fixed incorrect output forces with staged PP-PME communication
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+With GPUs, separate PME rank, staged PP-PME communications, and force-output
+used on non-virial steps, the written forces were lacking the PME contribution.
+
+Fix empty domain handling in PP-PME GPU communication
+"""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+Inconsistencies in the handling of empty domains in PP-PME coordinate
+communications could have led to deadlocks and missing synchronizations.
+Happened with both threadMPI and GPU-aware MPI
+
+:issue:`5132`
+
+Fix race condition with stale shift vectors in GPU non-local nonbonded kernel
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+With domain decomposition, GPU nonbonded interactions, GPU coordinate
+buffer operations and a changing box (e.g., pressure coupling), the
+non-local nonbonded kernel could use the shift vectors from the previous
+step, leading to incorrect forces between local and non-local atoms
+interacting across a periodic boundary. The effect is expected to be minor
+in well-equilibrated systems.
+
+:issue:`5724`
+
+Fixes for ``gmx`` tools
+^^^^^^^^^^^^^^^^^^^^^^^
+
+Fix stack overflow in ``grompp`` with large ifdef blocks
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+A recursion was replaced with a plain loop to avoid ``gmx grompp``
+crashing with large ifdef blocks.
+
+:issue:`5683`
+
+Increased precision of time processing in ``gmx eneconv``
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+All internal time processing in ``gmx eneconv`` now preserves the full double
+precision of the time stamps. This avoids picking of incorrect frames when
+times are large and intervals are small.
+
+:issue:`5219`
+
+Reported AWH friction was off by a factor kT^2
+""""""""""""""""""""""""""""""""""""""""""""""
+
+The ``gmx awh`` tool now applies the correct conversion of elements
+of the metric tensor to friction output. Friction values obtained with
+older versions of the tool can be corrected by dividing by kT^2.
+
+:issue:`5702`
+
+Fix wrong cell shifts in NNPot pair list input
+""""""""""""""""""""""""""""""""""""""""""""""
+
+For NNP models that request the |Gromacs| pair list as input, the cell shifts were
+were incorrectly computed, leading to wrong energies and forces on triclinic simulation
+boxes.
+
+:issue:`5705`
+
+Fixes that affect portability
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Fixed SYCL build with HeFFTe
+""""""""""""""""""""""""""""
+
+Work around icpx compiler crash in localtopology.cpp at RelWithAssert
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The Intel LLVM compiler (icpx, observed with oneAPI 2026.0) segfaults in
+its frontend while optimizing ``make_local_bondeds_excls()`` in
+``domdec/localtopology.cpp`` at ``-O3`` with assertions enabled
+(RelWithAssert configuration). The file is now compiled at ``-O2`` when
+building with IntelLLVM 2026.x in RelWithAssert mode; this has no meaningful
+performance impact as the file contains domain-decomposition setup code,
+not hot kernels.
+
+:issue:`5636`
+
+Miscellaneous
+^^^^^^^^^^^^^
+
+Stopped installing lmfit content
+""""""""""""""""""""""""""""""""
+
+Some unnecessary CMake code which was problematic with IDEs and CMake
+version at least 4.3 is now removed.
+
+:issue:`5668`
+
+Updated DOI to the preprint describing AMBER14SB and AMBER19SB conversion and validation
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+AMBER14SB and AMBER19SB force field :ref:`itp` files contained a placeholder
+link to the preprint describing the conversion and validation steps. Now that the
+preprint is uploaded on ChemRxiv, the placeholder was replaced with the DOI of
+the preprint, `doi:10.26434/chemrxiv.15006112/v1 <https://doi.org/10.26434/chemrxiv.15006112/v1>`_.
+
+:issue:`5690`
+
+Fix FLOPs-based dynamic load balancing
+""""""""""""""""""""""""""""""""""""""
+
+The FLOPs-based DLB algorithm (activated via ``GMX_DLB_BASED_ON_FLOPS``)
+was not accounting for non-bonded kernels, making it ineffectual.
+The default timer-based DLB was not affected.
+
+:issue:`5698`
+
+Fix CSV output of ``gmx nonbonded-benchmark``
+"""""""""""""""""""""""""""""""""""""""""""""
+
+Previously, the CSV file (``-o`` option) did not contain the results
+unless ``-time`` was also specified.
+
+Fixes to the Colvars library
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This release contains the following bugfixes from the`Colvars repository
+<https://github.com/Colvars/colvars>`_:
+
+* fix: correctly implement the wrap function for orientation_angle (`Colvars PR 943
+  <https://github.com/Colvars/colvars/pull/943>`_)

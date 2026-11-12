@@ -49,6 +49,8 @@ struct gmx_enerdata_t;
 enum class PbcType;
 class GpuEventSynchronizer;
 
+class DeviceStream;
+
 namespace gmx
 {
 class MpiComm;
@@ -115,6 +117,15 @@ public:
 
     //! Device RVec force buffer from the most recent device evaluation.
     virtual DeviceBuffer<RVec> deviceForceBuffer() const { return {}; }
+
+    //! Stream on which device work must be enqueued (may be null).
+    virtual void setDeviceStream(const DeviceStream* /* stream */) {}
+
+    //! Whether this step needs energy/virial on the host.
+    virtual void setStepComputeFlags(bool /* computeEnergy */, bool /* computeVirial */) {}
+
+    //! Block until the last device evaluation has completed.
+    virtual void waitForDeviceForces() const {}
 };
 
 } // namespace gmx

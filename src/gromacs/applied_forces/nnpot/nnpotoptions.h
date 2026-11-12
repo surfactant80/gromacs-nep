@@ -47,6 +47,7 @@
 #include <string>
 #include <vector>
 
+#include "gromacs/applied_forces/nnpot/nepbackendsettings.h"
 #include "gromacs/mdtypes/imdpoptionprovider.h"
 #include "gromacs/topology/atoms.h"
 #include "gromacs/topology/embedded_system_preprocessing.h"
@@ -133,8 +134,29 @@ struct NNPotParameters
     bool useGromacsElectrostatics_ = false;
     //! qNEP: predict dynamic charges and let GROMACS own the electrostatics.
     bool gromacsCharges_ = false;
+    //! qNEP charge dump frame interval in steps (0 = off).
+    int64_t chargesNst_ = 0;
+    //! qNEP charge dump output file name.
+    std::string chargesOutput_ = "qnep-charges.qnc";
     //! Optional per-element constant offsets, e.g. "H:-1.2 C:3.4" in kJ/mol/atom.
     std::string energyOffsets_;
+
+    //! Requested NEP/qNEP engine: auto, gpumd or wpe (nnpot-backend).
+    std::string backend_ = "auto";
+    //! Explicit WPE shared library or directory (nnpot-wpe-library).
+    std::string wpeLibrary_;
+    //! qNEP reciprocal-space method for WPE: pppm or ewald.
+    std::string wpeKspace_ = "pppm";
+    //! WPE PPPM mesh spacing in Angstrom (0.2 - 2.0).
+    real wpePppmSpacing_ = 1.0;
+    //! qNEP reciprocal-space method for the native GPUMD backend.
+    std::string gpumdKspace_ = "pppm";
+    //! Native GPUMD PPPM spacing in Angstrom (0 keeps the model default).
+    real gpumdPppmSpacing_ = 0.0;
+    //! Optional D3 correction: "<functional> <rc_potential> <rc_coordination>".
+    std::string dftd3_;
+    //! Ensemble label derived from the input record and forwarded to WPE.
+    std::string ensembleName_ = "nve";
 
     //! Adaptive A/B coupling mode.
     NNPotAdaptiveMode adaptiveMode_ = NNPotAdaptiveMode::Off;
@@ -219,6 +241,9 @@ public:
     //! get NNPot parameters
     const NNPotParameters& parameters();
 
+    //! Translate the mdp parameters into NEP backend settings.
+    NepBackendSettings nepBackendSettings() const;
+
     //! set PBC type during simulation setup
     void setPbcType(const PbcType& /*pbcType*/);
 
@@ -226,6 +251,9 @@ public:
     void            setWarninp(WarningHandler* /*wi*/);
     const MDLogger& logger() const;
     const MpiComm&  mpiComm() const;
+
+    //! Derive the ensemble label (nve/nvt/npt) forwarded to the WPE engine.
+    void setEnsembleNameFromInputrec(const t_inputrec& inputrec);
 
 private:
 //! Make sure that model and model inputs are compatible
@@ -251,6 +279,9 @@ private:
     //! Instance of warning bookkeeper
     WarningHandler* wi_ = nullptr;
 };
+
+//! Translate stored NNPot parameters into NEP backend settings (mdrun side).
+NepBackendSettings makeNepBackendSettings(const NNPotParameters& parameters);
 
 } // namespace gmx
 

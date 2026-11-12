@@ -2,6 +2,8 @@
 
 #include "nepmodel.h"
 
+#include "gromacs/gpu_utils/device_stream.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -25,15 +27,30 @@
 #include "gromacs/utility/exceptions.h"
 #include "gromacs/utility/logger.h"
 #include "gromacs/utility/mpicomm.h"
+#include "gromacs/utility/stringutil.h"
 
 #include "nepmodel_qnep_gromacs.h"
+#include "wpeloader.h"
+#include "wpepotential.h"
 #include "model/box.cuh"
 #include "utilities/gpu_vector.cuh"
+#include "utilities/run_input.cuh"
 #include "force/nep.cuh"
 #include "force/nep_charge.cuh"
+#if GMX_NEP_HAVE_VDW
+#include "force/nep_charge_vdw/nep_charge_vdw.cuh"
+#endif
 
 namespace
 {
+
+using gmx::formatString;
+using gmx::InconsistentInputError;
+using gmx::NepBackend;
+using gmx::NepBackendSettings;
+using gmx::NepModelFamily;
+using gmx::NepModelInfo;
+using gmx::WpeStageSettings;
 
 constexpr double c_evToKjMol = 96.48533212331002;
 constexpr double c_angstromPerNm = 10.0;
@@ -122,6 +139,7 @@ __global__ void convertForcesAndReduce(const int numAtoms,
     }
 }
 
+
 const char* const c_elements[] = {
     "H",  "He", "Li", "Be", "B",  "C",  "N",  "O",  "F",  "Ne", "Na", "Mg", "Al", "Si",
     "P",  "S",  "Cl", "Ar", "K",  "Ca", "Sc", "Ti", "V",  "Cr", "Mn", "Fe", "Co", "Ni",
@@ -131,31 +149,6 @@ const char* const c_elements[] = {
     "Lu", "Hf", "Ta", "W",  "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Po",
     "At", "Rn", "Fr", "Ra", "Ac", "Th", "Pa", "U",  "Np", "Pu"
 };
-
-std::vector<std::string> firstLineTokens(const std::string& filename)
-{
-    std::ifstream input(filename);
-    if (!input)
-    {
-        throw std::runtime_error("Cannot open NEP model file: " + filename);
-    }
-    std::string line;
-    while (std::getline(input, line))
-    {
-        if (line.find_first_not_of(" \t\r\n") != std::string::npos)
-        {
-            std::istringstream stream(line);
-            std::vector<std::string> result;
-            std::string token;
-            while (stream >> token)
-            {
-                result.push_back(token);
-            }
-            return result;
-        }
-    }
-    throw std::runtime_error("NEP model file is empty: " + filename);
-}
 
 int atomicNumber(const std::string& symbol)
 {
@@ -171,282 +164,117 @@ int atomicNumber(const std::string& symbol)
 
 std::string absolutePath(const std::string& filename)
 {
-#ifdef _WIN32
-    char buffer[_MAX_PATH];
-    if (_fullpath(buffer, filename.c_str(), _MAX_PATH) == nullptr)
-    {
-        throw std::runtime_error("Could not resolve NEP model path: " + filename);
-    }
-    return buffer;
-#else
     char* resolved = realpath(filename.c_str(), nullptr);
     if (resolved == nullptr)
     {
-        throw std::runtime_error("Could not resolve NEP model path: " + filename);
+        throw InconsistentInputError("Could not resolve NEP model path: " + filename);
     }
     std::string result(resolved);
     std::free(resolved);
     return result;
-#endif
 }
 
-bool isQnepHeader(const std::string& header)
-{
-    return header == "nep4_charge1" || header == "nep4_zbl_charge1"
-           || header == "nep4_charge2" || header == "nep4_zbl_charge2";
-}
-
-/*! \brief CPU-side structural validation of a GPUMD NEP model file.
+/*! \brief Build the GPUMD run.in lines that the NEP constructors consume.
  *
- * Replicates the arithmetic of the GPUMD parser to verify that the file
- * contains all expected descriptor/ANN parameter values. This allows grompp
- * to reject a broken model file without initializing CUDA.
+ * GPUMD's potential classes read a few run.in keywords directly (D3 correction
+ * and the qNEP reciprocal-space method). GROMACS synthesizes exactly those
+ * lines here instead of touching the working directory, so several ranks can
+ * create models concurrently and no run.in file is required.
  */
-void validateNepFileStructure(const std::string& filename)
+std::vector<std::string> buildGpumdRunInput(const NepModelInfo&       info,
+                                            const NepBackendSettings& settings,
+                                            const std::string&        modelFile)
 {
-    using gmx::InconsistentInputError;
-    std::ifstream input(filename);
-    if (!input)
-    {
-        throw InconsistentInputError("Cannot open NEP model file: " + filename);
-    }
     std::vector<std::string> lines;
-    std::string              line;
-    while (std::getline(input, line))
+    if (!settings.dftd3.empty())
     {
-        lines.push_back(line);
-    }
-
-    // Skip leading blank lines and read the header tokens.
-    size_t lineIndex = 0;
-    while (lineIndex < lines.size() && lines[lineIndex].find_first_not_of(" \t\r\n") == std::string::npos)
-    {
-        ++lineIndex;
-    }
-    auto tokensAt = [&](size_t index) -> std::vector<std::string>
-    {
-        if (index >= lines.size())
+        if (modelFile.find(' ') != std::string::npos)
         {
-            throw InconsistentInputError("NEP model file is truncated: " + filename);
+            throw InconsistentInputError(
+                    "The NEP D3 correction requires a model path without spaces because "
+                    "GPUMD's run.in tokenizer splits on whitespace.");
         }
-        std::istringstream stream(lines[index]);
-        std::vector<std::string> result;
-        std::string              token;
-        while (stream >> token)
+        lines.push_back("potential " + modelFile);
+        lines.push_back("dftd3 " + settings.dftd3);
+    }
+    if (info.family == NepModelFamily::Qnep || info.family == NepModelFamily::Qnep3Vdw)
+    {
+        if (settings.gpumdKspace == "ewald")
         {
-            result.push_back(token);
+            lines.push_back("kspace ewald");
         }
-        if (result.empty())
+        else if (settings.gpumdPppmSpacing > 0.0)
         {
-            throw InconsistentInputError("NEP model file has an empty parameter line: " + filename);
-        }
-        return result;
-    };
-
-    const std::vector<std::string> header = tokensAt(lineIndex++);
-    if (header.size() < 3)
-    {
-        throw InconsistentInputError("Invalid NEP model header.");
-    }
-    const bool hasZbl = header[0].find("zbl") != std::string::npos;
-    const int  numTypes = std::stoi(header[1]);
-    if (numTypes <= 0 || static_cast<int>(header.size()) != numTypes + 2)
-    {
-        throw InconsistentInputError("Invalid NEP model first line.");
-    }
-
-    if (hasZbl)
-    {
-        const auto zblTokens = tokensAt(lineIndex++);
-        if (zblTokens.size() < 3 || zblTokens.size() > 4 || zblTokens[0] != "zbl")
-        {
-            throw InconsistentInputError("Invalid ZBL line in NEP model.");
-        }
-        const double rcInner = std::stod(zblTokens[1]);
-        const double rcOuter = std::stod(zblTokens[2]);
-        if (rcInner == 0 && rcOuter == 0)
-        {
-            // Flexible ZBL: an extra 10 * ntypes*(ntypes+1)/2 values follow
-            // the regular parameter stream.
-        }
-    }
-    const auto cutoffTokens = tokensAt(lineIndex++);
-    if (cutoffTokens.size() != 5 || cutoffTokens[0] != "cutoff")
-    {
-        throw InconsistentInputError("Invalid cutoff line in NEP model.");
-    }
-    const auto nMaxTokens = tokensAt(lineIndex++);
-    if (nMaxTokens.size() != 3 || nMaxTokens[0] != "n_max")
-    {
-        throw InconsistentInputError("Invalid n_max line in NEP model.");
-    }
-    const int nMaxRadial  = std::stoi(nMaxTokens[1]);
-    const int nMaxAngular = std::stoi(nMaxTokens[2]);
-    const auto basisTokens = tokensAt(lineIndex++);
-    if (basisTokens.size() != 3 || basisTokens[0] != "basis_size")
-    {
-        throw InconsistentInputError("Invalid basis_size line in NEP model.");
-    }
-    const int basisRadial  = std::stoi(basisTokens[1]);
-    const int basisAngular = std::stoi(basisTokens[2]);
-    const auto lMaxTokens = tokensAt(lineIndex++);
-    if (lMaxTokens.size() < 4 || lMaxTokens[0] != "l_max")
-    {
-        throw InconsistentInputError("Invalid l_max line in NEP model.");
-    }
-    const int lMax = std::stoi(lMaxTokens[1]);
-    int       numL = lMax;
-    for (size_t i = 2; i < lMaxTokens.size(); ++i)
-    {
-        if (std::stoi(lMaxTokens[i]) != 0)
-        {
-            ++numL;
-        }
-    }
-    const auto annTokens = tokensAt(lineIndex++);
-    if (annTokens.size() != 3 || annTokens[0] != "ANN")
-    {
-        throw InconsistentInputError("Invalid ANN line in NEP model.");
-    }
-    const int neurons = std::stoi(annTokens[1]);
-
-    const int dim        = (nMaxRadial + 1) + (nMaxAngular + 1) * numL;
-    const int numTypesSq = numTypes * numTypes;
-    // Charge1/charge2 models store (dim+3) ANN parameters per neuron per type
-    // (w0, b0, w1, c) plus two shared parameters. Plain NEP4 models store
-    // (dim+2) ANN parameters per neuron per type (w0, b0, w1) plus one shared
-    // parameter. Both store dim q_scaler values after the descriptors.
-    const bool isQnep      = isQnepHeader(header[0]);
-    const int  numParaAnn  = isQnep ? (dim + 3) * neurons * numTypes + 2
-                                    : (dim + 2) * neurons * numTypes + 1;
-    const int  numParaDescr = numTypesSq
-                              * ((nMaxRadial + 1) * (basisRadial + 1)
-                                 + (nMaxAngular + 1) * (basisAngular + 1));
-    const size_t expectedValues = static_cast<size_t>(numParaAnn + numParaDescr + dim);
-
-    size_t valueCount = 0;
-    for (size_t i = lineIndex; i < lines.size(); ++i)
-    {
-        std::istringstream stream(lines[i]);
-        std::string        token;
-        while (stream >> token)
-        {
-            ++valueCount;
-        }
-    }
-    if (valueCount < expectedValues)
-    {
-        throw InconsistentInputError(
-                "NEP model file is truncated: expected at least " + std::to_string(expectedValues)
-                + " parameter values, found " + std::to_string(valueCount) + ".");
-     }
-}
-
-// State for the run.in isolation. The GPUMD constructors terminate the
-// process with exit() on errors (CUDA failures, input errors), which bypasses
-// C++ unwinding. The atexit handler removes the temporary blank run.in and
-// restores a displaced original run.in in that case.
-std::mutex  g_runInIsolationMutex;
-bool        g_runInIsolated = false;
-std::string g_runInBackup;
-
-
-void restoreRunInAfterExit()
-{
-    if (g_runInIsolated)
-    {
-        std::remove("run.in");
-        g_runInIsolated = false;
-        if (!g_runInBackup.empty())
-        {
-            std::rename(g_runInBackup.c_str(), "run.in");
-            g_runInBackup.clear();
-        }
-    }
-}
-
-std::unique_ptr<Potential> makeNepModel(const std::string& filename,
-                                        const std::string& modelHeader,
-                                        int                numAtoms)
-{
-    // Current GPUMD initializes its optional DFT-D3 add-on by reading a
-    // standalone-GPUMD run.in file in NEP's constructor. GROMACS must provide
-    // an empty one and must not accidentally consume an unrelated file in the
-    // run directory. Serialize construction, temporarily move an existing
-    // run.in aside, and restore it afterward. Avoid changing the process
-    // working directory: thread-MPI ranks share it.
-    std::lock_guard<std::mutex> lock(g_runInIsolationMutex);
-
-    const std::string absoluteModelPath = absolutePath(filename);
-    std::random_device randomDevice;
-    const std::string runInput = "run.in";
-    std::ifstream     existingRunInput(runInput);
-    const bool        hadRunInput = existingRunInput.good();
-    existingRunInput.close();
-    std::string       backupRunInput;
-    if (hadRunInput)
-    {
-        for (int attempt = 0; attempt < 100; ++attempt)
-        {
-            backupRunInput = "run.in.gromacs-nep-" + std::to_string(randomDevice())
-                             + "-" + std::to_string(randomDevice());
-            std::ifstream existingBackup(backupRunInput);
-            const bool backupExists = existingBackup.good();
-            existingBackup.close();
-            if (!backupExists && std::rename(runInput.c_str(), backupRunInput.c_str()) == 0)
-            {
-                break;
-            }
-            backupRunInput.clear();
-        }
-        if (backupRunInput.empty())
-        {
-            throw std::runtime_error("Could not temporarily isolate run.in for GPUMD NEP.");
-        }
-    }
-
-    static bool atexitRegistered = []()
-    {
-        std::atexit(restoreRunInAfterExit);
-        return true;
-    }();
-    GMX_UNUSED_VALUE(atexitRegistered);
-    g_runInIsolated = true;
-    g_runInBackup   = backupRunInput;
-
-    try
-    {
-        std::ofstream(runInput).close();
-        std::unique_ptr<Potential> model;
-        if (isQnepHeader(modelHeader))
-        {
-            model = std::make_unique<NEP_Charge>(absoluteModelPath.c_str(), numAtoms);
+            lines.push_back(formatString("kspace pppm %.6g", settings.gpumdPppmSpacing));
         }
         else
         {
-            model = std::make_unique<NEP>(absoluteModelPath.c_str(), numAtoms);
+            lines.push_back("kspace pppm");
         }
-        std::remove(runInput.c_str());
-        if (hadRunInput
-            && std::rename(backupRunInput.c_str(), runInput.c_str()) != 0)
-        {
-            throw std::runtime_error("Could not restore run.in after GPUMD NEP initialization.");
-        }
-        g_runInIsolated = false;
-        g_runInBackup.clear();
-        return model;
     }
-    catch (...)
+    return lines;
+}
+
+/*! \brief Instantiate the vendored GPUMD potential class for a model family. */
+std::unique_ptr<Potential> createGpumdModel(const NepModelInfo&       info,
+                                            const NepBackendSettings& settings,
+                                            const std::string&        modelFile,
+                                            const int                 numAtoms)
+{
+    const RunInput runInput(buildGpumdRunInput(info, settings, modelFile));
+    switch (info.family)
     {
-        g_runInIsolated = false;
-        g_runInBackup.clear();
-        std::remove(runInput.c_str());
-        if (hadRunInput)
-        {
-            std::rename(backupRunInput.c_str(), runInput.c_str());
-        }
-        throw;
+        case NepModelFamily::Nep4:
+            return std::make_unique<NEP>(modelFile.c_str(), numAtoms, runInput);
+        case NepModelFamily::Qnep:
+            return std::make_unique<NEP_Charge>(modelFile.c_str(), numAtoms, runInput);
+#if GMX_NEP_HAVE_VDW
+        case NepModelFamily::NepVdw:
+        case NepModelFamily::Qnep3Vdw:
+            return std::make_unique<NEP_Charge_VDW>(modelFile.c_str(), numAtoms, runInput);
+#endif
+        case NepModelFamily::Unsupported:
+        default:
+            throw InconsistentInputError(
+                    "The vendored GPUMD backend cannot evaluate this model: "
+                    + info.unsupportedReason);
     }
+}
+
+/*! \brief Translate the mdp backend settings into WPE stage facts. */
+WpeStageSettings makeWpeStageSettings(const NepModelInfo&       info,
+                                      const NepBackendSettings& settings)
+{
+    WpeStageSettings stage;
+    stage.ensembleName      = settings.ensembleName;
+    stage.qnepKspaceMethod  = settings.wpeKspace == "ewald" ? WPE_QNEP_KSPACE_EWALD
+                                                           : WPE_QNEP_KSPACE_PPPM;
+    stage.qnepPppmSpacing   = settings.wpePppmSpacing;
+    stage.needChargeOutput  = settings.wantChargeOutput && isQnepModel(info);
+    stage.needBecOutput     = false;
+    // Debug/compatibility switch: request the expensive 9N atomic virials
+    // instead of the default six-component system virial.
+    stage.needAtomVirial    = std::getenv("GMX_WPE_ATOM_VIRIAL") != nullptr;
+
+    if (!settings.dftd3.empty())
+    {
+        std::istringstream stream(settings.dftd3);
+        std::string        functional;
+        double             rcPotential = 0.0;
+        double             rcCoordination = 0.0;
+        std::string        extra;
+        if (!(stream >> functional >> rcPotential >> rcCoordination) || (stream >> extra))
+        {
+            throw InconsistentInputError(
+                    "nnpot-dftd3 must contain '<functional> <rc_potential> "
+                    "<rc_coordination_number>'.");
+        }
+        stage.dftd3Enabled              = true;
+        stage.dftd3Functional           = functional;
+        stage.dftd3RcPotential          = static_cast<float>(rcPotential);
+        stage.dftd3RcCoordinationNumber = static_cast<float>(rcCoordination);
+    }
+    return stage;
 }
 
 } // namespace
@@ -456,70 +284,175 @@ namespace gmx
 
 struct NepModel::Impl
 {
-    explicit Impl(const std::string& filename,
-                  const MDLogger&    logger,
-                  const MpiComm&     mpiComm,
-                  const bool         gromacsCharges) :
+    explicit Impl(const std::string&        filename,
+                  const MDLogger&           logger,
+                  const MpiComm&            mpiComm,
+                  const bool                gromacsCharges,
+                  const NepBackendSettings& settings) :
         modelFile(absolutePath(filename)),
+        settings(settings),
         logger(logger),
         mpiComm(mpiComm)
     {
-        const auto tokens = firstLineTokens(modelFile);
-        if (tokens.size() < 3
-            || (tokens[0] != "nep4" && tokens[0] != "nep4_zbl"
-                && tokens[0] != "nep5" && tokens[0] != "nep5_zbl"
-                && !isQnepHeader(tokens[0])))
-        {
-            throw InconsistentInputError(
-                    "GROMACS NEP backend supports NEP4/NEP5 and qNEP charge1/charge2 "
-                    "potential files.");
-        }
-        modelHeader = tokens[0];
-        isQnep = isQnepHeader(modelHeader);
-        if (modelHeader == "nep4_charge1" || modelHeader == "nep4_zbl_charge1")
-        {
-            chargeMode = 1;
-        }
-        else if (modelHeader == "nep4_charge2" || modelHeader == "nep4_zbl_charge2")
-        {
-            chargeMode = 2;
-        }
-        if (gromacsCharges)
-        {
-            if (!isQnep)
-            {
-                throw InconsistentInputError(
-                        "nnpot-gromacs-charges requires a qNEP charge1/charge2 model.");
-            }
-            if (modelHeader.find("zbl") != std::string::npos)
-            {
-                throw InconsistentInputError(
-                        "GROMACS-owned qNEP electrostatics does not support ZBL qNEP "
-                        "models yet.");
-            }
-        }
+        info             = readNepModelInfo(modelFile);
+        isQnep           = isQnepModel(info);
+        chargeMode       = info.chargeMode;
         useGromacsCharges = gromacsCharges;
 
-        const int numTypes = std::stoi(tokens[1]);
-        if (numTypes <= 0 || static_cast<int>(tokens.size()) != numTypes + 2)
+        for (int i = 0; i < info.numTypes; ++i)
         {
-            throw InconsistentInputError("Invalid NEP model first line.");
-        }
-
-        typeByAtomicNumber.reserve(numTypes);
-        for (int i = 0; i < numTypes; ++i)
-        {
-            const int z = atomicNumber(tokens[i + 2]);
+            const int z = atomicNumber(info.elements[i]);
             if (z < 0)
             {
-                throw InconsistentInputError("Unknown element in NEP model: " + tokens[i + 2]);
+                throw InconsistentInputError("Unknown element in NEP model: "
+                                             + info.elements[i]);
             }
             typeByAtomicNumber.emplace(z, i);
         }
-        // Validate the model file structure on the CPU so that grompp does not
-        // need a GPU. The actual GPUMD model (and its CUDA buffers) is created
-        // lazily on the first force evaluation.
-        validateNepFileStructure(modelFile);
+
+        resolveBackend();
+
+        if (useGromacsCharges)
+        {
+            if (backend != NepBackend::Gpumd)
+            {
+                throw InconsistentInputError(
+                        "nnpot-gromacs-charges needs the vendored GPUMD backend because the "
+                        "charge-response chain rule reads GPUMD's descriptor kernels. Select "
+                        "nnpot-backend = gpumd, or use native qNEP electrostatics with WPE.");
+            }
+            if (!isQnep)
+            {
+                throw InconsistentInputError(
+                        "nnpot-gromacs-charges requires a qNEP charge1/charge2 model; a plain "
+                        "NEP has no dynamic charges.");
+            }
+            if (info.hasZbl)
+            {
+                throw InconsistentInputError(
+                        "GROMACS-owned qNEP electrostatics does not support ZBL qNEP models.");
+            }
+            if (info.chargeMode == 3)
+            {
+                throw InconsistentInputError(
+                        "GROMACS-owned qNEP electrostatics supports charge1/charge2 models; "
+                        "charge3 models must use native qNEP electrostatics.");
+            }
+        }
+    }
+
+    /*! \brief Decide which engine evaluates the model.
+     *
+     * This runs during grompp as well, so it must not touch CUDA. WPE library
+     * discovery is a filesystem/LD_LIBRARY_PATH search only; the engine is
+     * dlopen()ed on the first device evaluation in mdrun.
+     */
+    void resolveBackend()
+    {
+        std::string       reason;
+        const bool        wpeCompiled = WpeLoader::isCompiledIn();
+        const bool        wpeModel    = wpeSupportsModel(info, &reason);
+        const std::string wpeLibrary  = WpeLoader::findLibrary(settings.wpeLibrary);
+        const bool        wpePresent  = !wpeLibrary.empty();
+        std::string       gpumdReason;
+        const bool        gpumdModel = gpumdSupportsModel(info, &gpumdReason);
+
+        if (useGromacsCharges)
+        {
+            backend = NepBackend::Gpumd;
+            return;
+        }
+
+        switch (settings.backend)
+        {
+            case NepBackend::Wpe:
+                if (!wpeCompiled)
+                {
+                    throw InconsistentInputError(
+                            "nnpot-backend = wpe requires a GROMACS build configured with "
+                            "-DGMX_NEP_WPE=ON.");
+                }
+                if (!wpeModel)
+                {
+                    throw InconsistentInputError(
+                            "The WPE backend cannot evaluate this model: " + reason
+                            + " Use nnpot-backend = gpumd for the vendored GPUMD kernels.");
+                }
+                if (!wpePresent)
+                {
+                    throw InconsistentInputError(
+                            "The WPE backend was requested but libwisevolve_potential.so was "
+                            "not found. Set nnpot-wpe-library (or $GMX_WPE_LIBRARY) to the WPE "
+                            "runtime directory, or add it to $LD_LIBRARY_PATH.");
+                }
+                backend = NepBackend::Wpe;
+                break;
+            case NepBackend::Gpumd:
+                if (!gpumdModel)
+                {
+                    throw InconsistentInputError(
+                            "The vendor GPUMD backend cannot evaluate this model: " + gpumdReason);
+                }
+                backend = NepBackend::Gpumd;
+                break;
+            case NepBackend::Auto:
+            default:
+                if (wpeCompiled && wpeModel && wpePresent)
+                {
+                    backend = NepBackend::Wpe;
+                }
+                else
+                {
+                    if (!gpumdModel)
+                    {
+                        // Neither engine can run this model. Prefer the WPE shape
+                        // explanation when WPE was compiled in, since it is the more
+                        // specific diagnosis for a WPE-shaped model.
+                        throw InconsistentInputError(
+                                "No available NEP backend can evaluate this model. GPUMD: "
+                                + gpumdReason
+                                + (wpeCompiled ? (" WPE: " + reason) : std::string()));
+                    }
+                    backend = NepBackend::Gpumd;
+                    if (wpeCompiled && wpeModel && !wpePresent)
+                    {
+                        backendNote =
+                                "WPE supports this model but libwisevolve_potential.so was not "
+                                "found, so the vendored GPUMD backend is used.";
+                    }
+                    else if (wpeCompiled && !wpeModel)
+                    {
+                        backendNote = "WPE cannot evaluate this model (" + reason
+                                      + "), using the vendored GPUMD backend.";
+                    }
+                }
+                break;
+        }
+    }
+
+    /*! \brief Create the engine instance on first use (mdrun, after CUDA init). */
+    std::unique_ptr<Potential> createModel(const int numAtoms)
+    {
+        if (backend == NepBackend::Wpe)
+        {
+            auto wpeModel = std::make_unique<WpePotential>(modelFile,
+                                                           numAtoms,
+                                                           makeWpeStageSettings(info, settings),
+                                                           settings.wpeLibrary);
+            GMX_LOG(logger.info)
+                    .appendTextFormatted(
+                            "Using WPE backend: %s %s (library %s)\n",
+                            wpeModel->engineName().c_str(),
+                            wpeModel->engineVersion().c_str(),
+                            wpeModel->libraryPath().c_str());
+            if (!wpeModel->engineCitation().empty())
+            {
+                GMX_LOG(logger.info)
+                        .appendText("WPE citation: " + wpeModel->engineCitation() + "\n");
+            }
+            return wpeModel;
+        }
+        return createGpumdModel(info, settings, modelFile, numAtoms);
     }
 
     ~Impl()
@@ -547,13 +480,38 @@ struct NepModel::Impl
         }
     }
 
-    //! Create the GPUMD model (and its CUDA buffers) with the given number
-    //! of atoms, unless it already exists with the right size.
+    //! Create the GPUMD/WPE model (and its CUDA buffers) for \p numAtoms.
     void ensureModel(int numAtoms)
     {
         if (model == nullptr || modelAtomCount != numAtoms)
         {
-            model = makeNepModel(modelFile, modelHeader, numAtoms);
+            // Resolve and load the WPE runtime first: this reports a missing
+            // proprietary engine or a missing CUDA runtime dependency before
+            // the GPU availability check, which is the more actionable error.
+            if (backend == NepBackend::Wpe)
+            {
+                std::string loadError;
+                if (WpeLoader::instance(settings.wpeLibrary, &loadError) == nullptr)
+                {
+                    throw InconsistentInputError(
+                            "The WPE backend was selected but the Wisevolve Potential "
+                            "Engine could not be loaded: "
+                            + loadError);
+                }
+            }
+            // Model construction allocates CUDA buffers, so this is the first
+            // point in mdrun where a GPU is required. grompp never gets here.
+            int         deviceCount = 0;
+            const auto  status      = cudaGetDeviceCount(&deviceCount);
+            if (status != cudaSuccess || deviceCount == 0)
+            {
+                throw InconsistentInputError(
+                        "The NEP/qNEP backend needs a visible CUDA device in mdrun. "
+                        "grompp, topology processing and model validation work without a GPU. "
+                        "Check the NVIDIA driver, the device visibility (CUDA_VISIBLE_DEVICES) "
+                        "and the CUDA architecture of this GROMACS build.");
+            }
+            model          = createModel(numAtoms);
             modelAtomCount = numAtoms;
         }
         model->N1 = 0;
@@ -621,7 +579,10 @@ struct NepModel::Impl
     }
 
     std::string modelFile;
-    std::string modelHeader;
+    NepModelInfo info;
+    NepBackendSettings settings;
+    NepBackend backend = NepBackend::Gpumd;
+    std::string backendNote;
     bool isQnep = false;
     bool useGromacsCharges = false;
     int chargeMode = 0;
@@ -647,15 +608,23 @@ struct NepModel::Impl
     double* hostSummary = nullptr;
     float* hostCharges = nullptr;
     cudaEvent_t completionEvent = nullptr;
+    // Stream used by the caller for the following GPU force reduction.
+    const DeviceStream* deviceStream = nullptr;
+    // Events used to order the default-stream engine call against that stream.
+    cudaEvent_t computeStartEvent = nullptr;
+    cudaEvent_t computeDoneEvent  = nullptr;
+    bool        stepComputeEnergy = true;
+    bool        stepComputeVirial = true;
     const MDLogger& logger;
     const MpiComm& mpiComm;
 };
 
-NepModel::NepModel(const std::string& filename,
-                   const MDLogger&    logger,
-                   const MpiComm&     mpiComm,
-                   const bool         gromacsCharges) :
-    impl_(std::make_unique<Impl>(filename, logger, mpiComm, gromacsCharges))
+NepModel::NepModel(const std::string&        filename,
+                   const MDLogger&           logger,
+                   const MpiComm&            mpiComm,
+                   const bool                gromacsCharges,
+                   const NepBackendSettings& settings) :
+    impl_(std::make_unique<Impl>(filename, logger, mpiComm, gromacsCharges, settings))
 {}
 
 NepModel::~NepModel() = default;
@@ -664,6 +633,144 @@ void NepModel::prepareDeviceBuffers(int numModelAtoms, int numOutputAtoms)
 {
     impl_->resizeModel(numModelAtoms);
     impl_->resizeOutput(numOutputAtoms);
+}
+
+void NepModel::dumpChargesHost(std::vector<float>& out)
+{
+    const int n = impl_->modelAtomCount;
+    if (impl_->model == nullptr || n == 0)
+    {
+        out.clear();
+        return;
+    }
+    // Both the GPUMD charge models and the WPE engine publish their charges
+    // through the Potential interface, so the same accessor works for both.
+    GPU_Vector<float>& charges = impl_->model->get_charge_reference();
+    out.assign(n, 0.0f);
+    if (charges.size() >= static_cast<size_t>(n))
+    {
+        charges.copy_to_host(out.data());
+    }
+}
+
+std::vector<int> NepModel::coveredAtomicNumbers() const
+{
+    std::vector<int> result;
+    result.reserve(impl_->typeByAtomicNumber.size());
+    for (const auto& entry : impl_->typeByAtomicNumber)
+    {
+        result.push_back(entry.first);
+    }
+    return result;
+}
+
+bool NepModel::predictChargesHostFrame(ArrayRef<const RVec> x,
+                                       const matrix&         box,
+                                       int                  homenr,
+                                       double               rcoulombNm,
+                                       ArrayRef<const int>  atomNumbers,
+                                       std::vector<float>&  charges)
+{
+    (void)homenr;
+    (void)homenr;
+    if (impl_->backend != NepBackend::Gpumd || !impl_->isQnep || x.empty()
+        || atomNumbers.size() != x.size())
+    {
+        if (std::getenv("GMX_QNEP_DEBUG") != nullptr)
+        {
+            fprintf(stderr, "[qnep-predict] reject: isQnep=%d x=%zu atomNumbers=%zu\n",
+                    static_cast<int>(impl_->isQnep), x.size(), atomNumbers.size());
+        }
+        return false;
+    }
+    const int numAtoms = x.size();
+    impl_->resizeModel(numAtoms);
+    if (impl_->model == nullptr)
+    {
+        return false;
+    }
+    for (int i = 0; i < numAtoms; ++i)
+    {
+        const auto it = impl_->typeByAtomicNumber.find(atomNumbers[i]);
+        if (it == impl_->typeByAtomicNumber.end())
+        {
+            if (std::getenv("GMX_QNEP_DEBUG") != nullptr)
+            {
+                fprintf(stderr, "[qnep-predict] atom %d has atomic number %d not in model\n",
+                        i, atomNumbers[i]);
+            }
+            return false;
+        }
+        impl_->hostTypes[i] = it->second;
+    }
+    impl_->types.copy_from_host(impl_->hostTypes.data());
+
+    if (impl_->qnepGromacs_ == nullptr)
+    {
+        impl_->qnepGromacs_ = std::make_unique<NepQnepGromacs>(
+                static_cast<NEP_Charge*>(impl_->model.get()),
+                impl_->chargeMode,
+                static_cast<float>(rcoulombNm * c_angstromPerNm),
+                numAtoms);
+    }
+
+    std::vector<double> posHost(3 * numAtoms);
+    for (int i = 0; i < numAtoms; ++i)
+    {
+        posHost[i]             = static_cast<double>(x[i][XX]) * c_angstromPerNm;
+        posHost[numAtoms + i]  = static_cast<double>(x[i][YY]) * c_angstromPerNm;
+        posHost[2 * numAtoms + i] = static_cast<double>(x[i][ZZ]) * c_angstromPerNm;
+    }
+    impl_->positions.copy_from_host(posHost.data());
+
+    Box nepBox;
+    std::fill(nepBox.cpu_h, nepBox.cpu_h + 18, 0.0);
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 3; ++j)
+        {
+            nepBox.cpu_h[3 * j + i] = box[i][j] * c_angstromPerNm;
+        }
+    }
+    nepBox.get_inverse();
+    nepBox.set_is_orthogonal();
+    nepBox.pbc_x = true;
+    nepBox.pbc_y = true;
+    nepBox.pbc_z = true;
+
+    charges.resize(numAtoms);
+    impl_->qnepGromacs_->predictCharges(
+            nepBox, impl_->types, impl_->positions, charges.data(), impl_->potential, numAtoms);
+    return true;
+}
+
+void NepModel::setDeviceStream(const DeviceStream* stream)
+{
+    // Debug/benchmark switch: force the legacy host-synchronized path.
+    if (std::getenv("GMX_NEP_NO_ASYNC") != nullptr)
+    {
+        stream = nullptr;
+    }
+    impl_->deviceStream = stream;
+    if (stream != nullptr && impl_->computeStartEvent == nullptr)
+    {
+        CHECK(cudaEventCreateWithFlags(&impl_->computeStartEvent, cudaEventDisableTiming));
+        CHECK(cudaEventCreateWithFlags(&impl_->computeDoneEvent, cudaEventDisableTiming));
+    }
+}
+
+void NepModel::setStepComputeFlags(const bool computeEnergy, const bool computeVirial)
+{
+    impl_->stepComputeEnergy = computeEnergy;
+    impl_->stepComputeVirial = computeVirial;
+}
+
+void NepModel::waitForDeviceForces() const
+{
+    if (impl_->completionEvent != nullptr)
+    {
+        CHECK(cudaEventSynchronize(impl_->completionEvent));
+    }
 }
 
 DeviceBuffer<RVec> NepModel::deviceForceBuffer() const
@@ -745,54 +852,88 @@ bool NepModel::evaluateModelDevice(gmx_enerdata_t*     enerd,
     nepBox.pbc_y = (*pbcType == PbcType::Xyz || *pbcType == PbcType::XY);
     nepBox.pbc_z = (*pbcType == PbcType::Xyz);
 
-    // The external GPUMD kernels use the legacy default stream. Consume the
-    // GROMACS coordinate-ready event on the host before launching that work.
-    // This still avoids both the coordinate D2H and NEP-force H2D transfers.
+    // Enqueue our work on the same stream that the following GPU force
+    // reduction uses. The engine (GPUMD/WPE) always launches on the legacy
+    // default stream, so a pair of events hands that work over to/from our
+    // stream without a per-step host synchronization.
+    cudaStream_t stream = nullptr;
+    if (impl_->deviceStream != nullptr && impl_->deviceStream->isValid())
+    {
+        stream = impl_->deviceStream->stream();
+    }
+    const bool async = (stream != nullptr);
+
     if (deviceCoordinatesReady != nullptr)
     {
-        deviceCoordinatesReady->waitForEvent();
+        if (async)
+        {
+            deviceCoordinatesReady->enqueueWaitEvent(*impl_->deviceStream);
+        }
+        else
+        {
+            deviceCoordinatesReady->waitForEvent();
+        }
     }
 
     const int atomBlocks =
             (numAtoms + c_postprocessBlockSize - 1) / c_postprocessBlockSize;
     convertPositionsToNep<real, true>
-            <<<atomBlocks, c_postprocessBlockSize>>>(numAtoms,
-                                                     reinterpret_cast<const real*>(
-                                                             deviceCoordinates),
-                                                     impl_->indexLookup.data(),
-                                                     impl_->positions.data());
+            <<<atomBlocks, c_postprocessBlockSize, 0, stream>>>(numAtoms,
+                                                                reinterpret_cast<const real*>(
+                                                                        deviceCoordinates),
+                                                                impl_->indexLookup.data(),
+                                                                impl_->positions.data());
     GPU_CHECK_KERNEL
 
-    CHECK(cudaMemsetAsync(impl_->potential.data(), 0, numAtoms * sizeof(double)));
-    CHECK(cudaMemsetAsync(impl_->forces.data(), 0, 3 * numAtoms * sizeof(double)));
-    CHECK(cudaMemsetAsync(impl_->virial.data(), 0, 9 * numAtoms * sizeof(double)));
-    CHECK(cudaMemsetAsync(impl_->summary.data(), 0, 10 * sizeof(double)));
-    CHECK(cudaMemsetAsync(impl_->outputForces.data(),
-                          0,
-                          3 * numOutputAtoms * sizeof(real)));
+    CHECK(cudaMemsetAsync(impl_->potential.data(), 0, numAtoms * sizeof(double), stream));
+    CHECK(cudaMemsetAsync(impl_->forces.data(), 0, 3 * numAtoms * sizeof(double), stream));
+    CHECK(cudaMemsetAsync(impl_->virial.data(), 0, 9 * numAtoms * sizeof(double), stream));
+    CHECK(cudaMemsetAsync(impl_->summary.data(), 0, 10 * sizeof(double), stream));
 
+    if (async)
+    {
+        CHECK(cudaEventRecord(impl_->computeStartEvent, stream));
+        CHECK(cudaStreamWaitEvent(nullptr, impl_->computeStartEvent, 0));
+    }
     impl_->model->compute(nepBox,
                           impl_->types,
                           impl_->positions,
                           impl_->potential,
                           impl_->forces,
                           impl_->virial);
+    if (async)
+    {
+        CHECK(cudaEventRecord(impl_->computeDoneEvent, nullptr));
+        CHECK(cudaStreamWaitEvent(stream, impl_->computeDoneEvent, 0));
+    }
 
     convertForcesAndReduce<real, true>
-            <<<atomBlocks, c_postprocessBlockSize>>>(numAtoms,
-                                                     impl_->potential.data(),
-                                                     impl_->forces.data(),
-                                                     impl_->virial.data(),
-                                                     impl_->indexLookup.data(),
-                                                     impl_->outputForces.data(),
-                                                     impl_->summary.data());
+            <<<atomBlocks, c_postprocessBlockSize, 0, stream>>>(numAtoms,
+                                                                impl_->potential.data(),
+                                                                impl_->forces.data(),
+                                                                impl_->virial.data(),
+                                                                impl_->indexLookup.data(),
+                                                                impl_->outputForces.data(),
+                                                                impl_->summary.data());
     GPU_CHECK_KERNEL
-    CHECK(cudaMemcpyAsync(impl_->hostSummary,
-                          impl_->summary.data(),
-                          10 * sizeof(double),
-                          cudaMemcpyDeviceToHost));
-    CHECK(cudaEventRecord(impl_->completionEvent, nullptr));
-    CHECK(cudaEventSynchronize(impl_->completionEvent));
+
+    // The force buffer stays on the device and is consumed by the GPU force
+    // reduction on the same stream. Energy/virial are only copied back on the
+    // steps that actually need them on the host.
+    const bool needSummary = impl_->stepComputeEnergy || impl_->stepComputeVirial;
+    if (needSummary || !async)
+    {
+        CHECK(cudaMemcpyAsync(impl_->hostSummary,
+                              impl_->summary.data(),
+                              10 * sizeof(double),
+                              cudaMemcpyDeviceToHost,
+                              stream));
+    }
+    CHECK(cudaEventRecord(impl_->completionEvent, stream));
+    if (needSummary || !async)
+    {
+        CHECK(cudaEventSynchronize(impl_->completionEvent));
+    }
 
     if (std::getenv("GMX_QNEP_DEBUG") != nullptr)
     {
@@ -811,7 +952,7 @@ bool NepModel::evaluateModelDevice(gmx_enerdata_t*     enerd,
                 impl_->hostForces[2]);
     }
 
-    if (virial != nullptr && impl_->mpiComm.isMainRank())
+    if (virial != nullptr && needSummary && impl_->mpiComm.isMainRank())
     {
         const double virialScale = -0.5 * c_evToKjMol;
         for (int component = 0; component < 9; ++component)
@@ -834,7 +975,9 @@ bool NepModel::evaluateModelDevice(gmx_enerdata_t*     enerd,
     }
 
     enerd->term[InteractionFunction::NeuralNetworkPotentialEnergy] =
-            impl_->mpiComm.isMainRank() ? impl_->hostSummary[0] * c_evToKjMol : 0.0;
+            (needSummary && impl_->mpiComm.isMainRank())
+                    ? impl_->hostSummary[0] * c_evToKjMol
+                    : 0.0;
     return true;
 }
 
@@ -952,13 +1095,10 @@ void NepModel::evaluateModel(gmx_enerdata_t*                  enerd,
     CHECK(cudaMemcpyAsync(impl_->hostForces,
                           impl_->outputForces.data(),
                           3 * numAtoms * sizeof(real),
-                          cudaMemcpyDeviceToHost));
-    CHECK(cudaMemcpyAsync(impl_->hostSummary,
+                          cudaMemcpyDeviceToHost));    CHECK(cudaMemcpyAsync(impl_->hostSummary,
                           impl_->summary.data(),
                           10 * sizeof(double),
                           cudaMemcpyDeviceToHost));
-    // Wait only for the NEP adapter's output event. Synchronizing the legacy
-    // default stream also waits for unrelated GROMACS GPU work.
     CHECK(cudaEventRecord(impl_->completionEvent, nullptr));
     CHECK(cudaEventSynchronize(impl_->completionEvent));
 
@@ -1052,8 +1192,25 @@ void NepModel::evaluateModel(gmx_enerdata_t*                  enerd,
 
 bool NepModel::hasDynamicCharges() const
 {
-    return impl_->useGromacsCharges && impl_->isQnep;
+    return impl_->useGromacsCharges && impl_->isQnep
+           && impl_->backend == NepBackend::Gpumd;
 }
+
+NepBackend NepModel::resolvedBackend() const
+{
+    return impl_->backend;
+}
+
+std::string NepModel::backendDescription() const
+{
+    std::string description = formatString("%s backend", nepBackendName(impl_->backend));
+    if (!impl_->backendNote.empty())
+    {
+        description += " (" + impl_->backendNote + ")";
+    }
+    return description;
+}
+
 
 namespace
 {
@@ -1087,8 +1244,8 @@ bool NepModel::updateChargesDevice(ArrayRef<real>             chargeA,
                                    const matrix&              box,
                                    int                        homenr)
 {
-    if (!impl_->useGromacsCharges || !impl_->isQnep || !deviceCoordinates || chargeA.empty()
-        || atomNumbers.size() != chargeA.size())
+    if (impl_->backend != NepBackend::Gpumd || !impl_->useGromacsCharges || !impl_->isQnep
+        || !deviceCoordinates || chargeA.empty() || atomNumbers.size() != chargeA.size())
     {
         return false;
     }
@@ -1197,9 +1354,9 @@ bool NepModel::evaluateModelDeviceQnepGromacs(gmx_enerdata_t*           enerd,
                                               bool                      computeEnergy,
                                               bool                      computeVirial)
 {
-    if (!impl_->useGromacsCharges || !impl_->isQnep || !coulombPotential || box == nullptr
-        || pbcType == nullptr || atomNumbers.empty() || indexLookup.size() != atomNumbers.size()
-        || numOutputAtoms <= 0)
+    if (impl_->backend != NepBackend::Gpumd || !impl_->useGromacsCharges || !impl_->isQnep
+        || !coulombPotential || box == nullptr || pbcType == nullptr || atomNumbers.empty()
+        || indexLookup.size() != atomNumbers.size() || numOutputAtoms <= 0)
     {
         return false;
     }

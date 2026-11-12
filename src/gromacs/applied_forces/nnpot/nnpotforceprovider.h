@@ -43,6 +43,8 @@
 
 #include <string.h>
 
+#include <fstream>
+
 #include <unordered_map>
 
 #include "gromacs/mdtypes/iforceprovider.h"
@@ -199,6 +201,14 @@ private:
 
     //! True when the most recent calculateForces() call produced the device force buffer.
     bool deviceForcesProduced_ = false;
+
+    //! Binary qNEP charge trajectory output (dynamic charges per step).
+    void writeQnepChargesFrame(double time, int64_t step, const float* charges, int n);
+    //! Fill lastCharges_ from the model after the native qNEP evaluation.
+    void refreshNativeCharges();
+    std::ofstream      qncFile_;
+    std::vector<float> lastCharges_;
+    int64_t            lastChargeStep_ = -1;
 
     //! Timings for the two qNEP-GROMACS phases (debug/profiling only).
     double lastUpdateChargesMs_ = 0;

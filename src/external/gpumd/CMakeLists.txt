@@ -9,6 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 # MSVC host compiler flags: /utf-8 for Unicode source, /Zc:preprocessor for standards-conforming preprocessor.
 if(MSVC)
@@ -23,20 +24,30 @@ file(GLOB GPUMD_SOURCES
     src/integrate/*.cu
     src/mc/*.cu
     src/force/*.cu
+    src/force/*/*.cu
     src/measure/*.cu
     src/model/*.cu
     src/utilities/*.cu)
 add_executable(gpumd ${GPUMD_SOURCES})
 target_include_directories(gpumd PRIVATE src)
-target_link_libraries(gpumd PRIVATE CUDA::cublas CUDA::cusolver CUDA::cufft)
+target_link_libraries(gpumd PRIVATE CUDA::cublas CUDA::cusolver CUDA::cufft Threads::Threads)
 
 # --- nep ---
 file(GLOB NEP_SOURCES
     src/main_nep/*.cu
+    src/main_nep/*/*.cu
     src/utilities/*.cu)
 add_executable(nep ${NEP_SOURCES})
 target_include_directories(nep PRIVATE src)
 target_link_libraries(nep PRIVATE CUDA::cublas CUDA::cusolver CUDA::cufft)
+
+# --- tb ---
+file(GLOB TB_SOURCES src/main_tb/*.cu)
+add_executable(tb ${TB_SOURCES}
+    src/utilities/error.cu
+    src/utilities/main_common.cu)
+target_include_directories(tb PRIVATE src)
+target_link_libraries(tb PRIVATE CUDA::cublas CUDA::cusolver)
 
 # --- gnep (optional, build with: cmake --build . --target gnep) ---
 file(GLOB GNEP_SOURCES
@@ -44,7 +55,15 @@ file(GLOB GNEP_SOURCES
     src/utilities/*.cu)
 add_executable(gnep EXCLUDE_FROM_ALL ${GNEP_SOURCES})
 target_include_directories(gnep PRIVATE src)
-target_link_libraries(gnep PRIVATE CUDA::cublas CUDA::cusolver CUDA::cufft)
+target_link_libraries(gnep PRIVATE CUDA::cublas CUDA::cusolver CUDA::cufft Threads::Threads)
+option(GNEP_TEST_DIAGNOSTICS "Export deterministic GNEP training diagnostics" OFF)
+if(GNEP_TEST_DIAGNOSTICS)
+    target_compile_definitions(gnep PRIVATE GNEP_TEST_DIAGNOSTICS)
+endif()
+option(GNEP_TEST_FIXED_SCALER "Keep the GNEP descriptor scaler fixed for gradient tests" OFF)
+if(GNEP_TEST_FIXED_SCALER)
+    target_compile_definitions(gnep PRIVATE USE_FIXED_SCALER)
+endif()
 
 
 # --- NNAP support (enable with -D PKG_NNAP=yes) ---

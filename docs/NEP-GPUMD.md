@@ -4,12 +4,32 @@ This tree adds a CUDA NEP backend to the existing GROMACS `nnpot` MD module.
 The GROMACS integrator, constraints, thermostats, barostats, PME and native
 GPU non-bonded kernels remain unchanged.
 
+## Status in GROMACS 2026.4 (2026-11 update)
+
+- Vendored engine: current GPUMD master (`src/external/gpumd`). The MD potential
+  classes now implement **NEP4 only**; `nep5`/`nep5_zbl` were dropped upstream
+  and are rejected with an explicit error.
+- Model formats: legacy (`nep4 ...`, `nep4_charge1 ...`) and the new
+  `nep <N> <elements>` format (`format_version 1`). Parsing and validation are
+  CPU-only (`nepmodelinfo.cpp`), so grompp still works without a GPU.
+- Model families: `nep4`, `nep4_zbl`, `nep4_charge1/2/3` (qNEP),
+  `nep_vdw`, `qnep3_vdw`, plus the new-format equivalents (`nep`, `qnep1/2/3`,
+  `nep_vdw`, `qnep3_vdw`).
+- Backends: `nnpot-backend = auto|gpumd|wpe`. The WPE engine is an optional
+  runtime-loaded backend (see `docs/WPE-GROMACS.md`). `nnpot-gromacs-charges`
+  always uses the vendored GPUMD kernels.
+- `RunInput` for the GPUMD constructors is synthesized in memory from mdp
+  options (`nnpot-gpumd-kspace`, `nnpot-dftd3`); no `run.in` file is read or
+  created.
+- qNEP charges are read through `Potential::get_charge_reference()`, which also
+  covers the WPE charge buffer.
+
 ## Model and units
 
-The model file is a GPUMD `nep4`, `nep4_zbl`, `nep5` or `nep5_zbl` text model.
-GROMACS coordinates are converted from nm to Angstrom before NEP evaluation.
-NEP energies and forces are converted from eV/eV-Angstrom to kJ/mol and
-kJ/mol/nm on return.
+The model file is a GPUMD NEP4/qNEP/vdW text model in legacy or new format
+(see above). GROMACS coordinates are converted from nm to Angstrom before NEP
+evaluation. NEP energies and forces are converted from eV/eV-Angstrom to
+kJ/mol and kJ/mol/nm on return.
 
 ## NNP/MM
 

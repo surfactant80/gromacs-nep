@@ -43,6 +43,7 @@
 #include "modules.h"
 
 #include "modules/angle.h"
+#include "modules/qnepcharge.h"
 #include "modules/convert_trj.h"
 #include "modules/distance.h"
 #include "modules/dssp.h"
@@ -95,6 +96,7 @@ void registerTrajectoryAnalysisModules(CommandLineModuleManager* manager)
     using namespace gmx::analysismodules;
     CommandLineModuleGroup group = manager->addModuleGroup("Trajectory analysis");
     registerModule<AngleInfo>(manager, group);
+    registerModule<QnepChargeInfo>(manager, group);
     registerModule<ConvertTrjInfo>(manager, group);
     registerModule<DistanceInfo>(manager, group);
     registerModule<DsspInfo>(manager, group);

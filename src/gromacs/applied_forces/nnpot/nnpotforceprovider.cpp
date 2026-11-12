@@ -130,6 +130,35 @@ static void centerAtomPositions(ArrayRef<RVec> nnPos, ArrayRef<RVec> mmPos, cons
     put_atoms_in_box(pbcType, box, mmPos);
 }
 
+void NNPotForceProvider::writeQnepChargesFrame(double time, int64_t step, const float* charges, int n)
+{
+    if (qncFile_ && n > 0)
+    {
+        qncFile_.write(reinterpret_cast<const char*>(&time), sizeof(double));
+        qncFile_.write(reinterpret_cast<const char*>(charges), sizeof(float) * n);
+    }
+}
+
+void NNPotForceProvider::refreshNativeCharges()
+{
+    std::vector<float> regionCharges;
+    std::static_pointer_cast<NepModel>(model_)->dumpChargesHost(regionCharges);
+    if (lastCharges_.size() < static_cast<size_t>(params_.numAtoms_))
+    {
+        lastCharges_.resize(params_.numAtoms_);
+    }
+    std::fill(lastCharges_.begin(), lastCharges_.end(), 0.0f);
+    const size_t nRegion = std::min(regionCharges.size(), inputToLocalIndex_.size());
+    for (size_t i = 0; i < nRegion; ++i)
+    {
+        const int localIndex = inputToLocalIndex_[i];
+        if (localIndex >= 0 && localIndex < static_cast<int>(lastCharges_.size()))
+        {
+            lastCharges_[localIndex] = regionCharges[i];
+        }
+    }
+}
+
 NNPotForceProvider::NNPotForceProvider(const NNPotParameters& nnpotParameters,
                                        const MDLogger&        logger,
                                        const MpiComm&         mpiComm) :
@@ -235,8 +264,11 @@ NNPotForceProvider::NNPotForceProvider(const NNPotParameters& nnpotParameters,
                         "qNEP with GROMACS-owned electrostatics does not support link atoms."));
             }
         }
-        model_ = std::make_shared<NepModel>(
-                params_.modelFileName_, logger_, mpiComm_, params_.gromacsCharges_);
+        model_ = std::make_shared<NepModel>(params_.modelFileName_,
+                                            logger_,
+                                            mpiComm_,
+                                            params_.gromacsCharges_,
+                                            makeNepBackendSettings(params_));
         if (params_.adaptiveMode_ != NNPotAdaptiveMode::Off)
         {
             adaptiveUnionModel_ = std::make_shared<NepModel>(
@@ -263,6 +295,24 @@ NNPotForceProvider::NNPotForceProvider(const NNPotParameters& nnpotParameters,
     else
     {
         GMX_THROW(FileIOError("Unrecognized extension for model file: " + params_.modelFileName_));
+    }
+
+    if (params_.chargesNst_ > 0 && !params_.gromacsCharges_)
+    {
+        lastCharges_.resize(params_.numAtoms_, 0.0f);
+    }
+    if (params_.chargesNst_ > 0)
+    {
+        qncFile_.open(params_.chargesOutput_, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!qncFile_)
+        {
+            GMX_THROW(FileIOError("Could not open qNEP charge trajectory: "
+                                  + params_.chargesOutput_));
+        }
+        const char magic[4] = { 'Q', 'N', 'C', '1' };
+        const int  natoms  = params_.numAtoms_;
+        qncFile_.write(magic, 4);
+        qncFile_.write(reinterpret_cast<const char*>(&natoms), sizeof(int));
     }
 }
 
@@ -326,11 +376,23 @@ void NNPotForceProvider::calculateForces(const ForceProviderInput& fInput, Force
                         lastUpdateChargesMs_, lastCalculateForcesMs_);
             }
             deviceForcesProduced_ = true;
+            if (params_.chargesNst_ > 0 && fInput.step_ != lastChargeStep_
+                && fInput.homenr_ > 0 && lastCharges_.size() >= static_cast<size_t>(fInput.homenr_)
+                && fInput.step_ % params_.chargesNst_ == 0)
+            {
+                writeQnepChargesFrame(fInput.t_, fInput.step_, lastCharges_.data(), fInput.homenr_);
+                lastChargeStep_ = fInput.step_;
+            }
             return;
         }
         GMX_THROW(InconsistentInputError(
                 "qNEP with GROMACS-owned electrostatics requires the GPU PME "
                 "per-atom potential output, which is not available in this run."));
+    }
+    if (deviceForcePathEnabled_ && fInput.deviceCoordinates_)
+    {
+        model_->setDeviceStream(fInput.deviceStream_);
+        model_->setStepComputeFlags(fInput.computeEnergy, fInput.computeVirial);
     }
     if (deviceForcePathEnabled_ && fInput.deviceCoordinates_
         && model_->evaluateModelDevice(&(fOutput->enerd_),
@@ -347,6 +409,14 @@ void NNPotForceProvider::calculateForces(const ForceProviderInput& fInput, Force
                 energyOffset(atomNumbers_);
         fOutput->forceWithVirial_.addVirialContribution(nnpVirial);
         deviceForcesProduced_ = true;
+        if (params_.chargesNst_ > 0 && fInput.step_ != lastChargeStep_
+            && params_.numAtoms_ > 0 && lastCharges_.size() >= static_cast<size_t>(params_.numAtoms_)
+            && fInput.step_ % params_.chargesNst_ == 0)
+        {
+            refreshNativeCharges();
+            writeQnepChargesFrame(fInput.t_, fInput.step_, lastCharges_.data(), params_.numAtoms_);
+            lastChargeStep_ = fInput.step_;
+        }
         return;
     }
     if (isNepModel || params_.modelNeedsInput("atom-positions"))
@@ -739,6 +809,10 @@ void NNPotForceProvider::preparePairlistInput()
     shiftVectors_.clear();
     shiftVectors_.reserve(numPairs);
 
+    // precompute shifts
+    std::array<RVec, c_numShiftVectors> shiftVecs;
+    calc_shifts(box_, shiftVecs);
+
     for (int i = 0; i < numPairs; i++)
     {
         const auto [atomPair, shiftIndex] = fullPairlist_[i];
@@ -752,13 +826,9 @@ void NNPotForceProvider::preparePairlistInput()
                 inputIdxB.has_value())
             {
                 // no need to check cutoff: pairlist already comes filtered by cutoff
-                RVec       shift;
-                const IVec unitShift = shiftIndexToXYZ(shiftIndex);
-                mvmul_ur0(box_, unitShift.toRVec(), shift);
-
                 pairlistForModel_.push_back(inputIdxA.value());
                 pairlistForModel_.push_back(inputIdxB.value());
-                shiftVectors_.push_back(shift);
+                shiftVectors_.push_back(shiftVecs[shiftIndex]);
             }
         }
     }
@@ -821,6 +891,17 @@ bool NNPotForceProvider::updateCharges(ArrayRef<const RVec>  x,
             homenr);
     auto t1 = std::chrono::steady_clock::now();
     lastUpdateChargesMs_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (params_.chargesNst_ > 0 && lastCharges_.size() < static_cast<size_t>(homenr))
+    {
+        lastCharges_.resize(homenr);
+    }
+    if (params_.chargesNst_ > 0 && homenr > 0)
+    {
+        for (int i = 0; i < homenr; ++i)
+        {
+            lastCharges_[i] = static_cast<float>(chargeA[i]);
+        }
+    }
     if (changed && std::getenv("GMX_QNEP_DEBUG") != nullptr)
     {
         double qsum = 0, q2sum = 0;

@@ -1,7 +1,7 @@
 GROMACS 2025.5 release notes
 ----------------------------
 
-This version was released on TODO, 2025. These release notes
+This version was released on August 31st, 2026. These release notes
 document the changes that have taken place in |Gromacs| since the
 previous 2025.4 version, to fix known issues. It also incorporates all
 fixes made in version 2024.6 and earlier, which you can find described
@@ -32,6 +32,17 @@ flag for RISC-V vector unit and using multiple energy groups, the reported short
 non-bonded energy could have been incorrect.
 
 :issue:`5534`
+
+Fixed pressure drift with virtual sites and OpenMP threading
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+When virtual sites were used with more than one OpenMP thread per rank, an accumulation
+buffer for the virial was not always cleared. This could cause the pressure to drift
+while other thermodynamic quantities looked normal. This issue has only been observed
+while other thermodynamic quantities looked normal. This issue only occured with more than
+200000 atoms per domain, i.e. MPI rank.
+
+:issue:`5661`
 
 Fixes for ``gmx`` tools
 ^^^^^^^^^^^^^^^^^^^^^^^

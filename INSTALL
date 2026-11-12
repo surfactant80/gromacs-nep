@@ -5,7 +5,7 @@ Installation guide
 Introduction to building GROMACS
 ================================
 
-These instructions pertain to building GROMACS 2026.3. You might also
+These instructions pertain to building GROMACS 2026.4. You might also
 want to check the up-to-date installation instructions.
 
 
@@ -28,8 +28,8 @@ Quick and dirty installation
 
 Or, as a sequence of commands to execute:
 
-   tar xfz gromacs-2026.3.tar.gz
-   cd gromacs-2026.3
+   tar xfz gromacs-2026.4.tar.gz
+   cd gromacs-2026.4
    mkdir build
    cd build
    cmake .. -DGMX_BUILD_OWN_FFTW=ON -DREGRESSIONTEST_DOWNLOAD=ON
@@ -152,7 +152,7 @@ The Intel classic compiler (icc/icpc) is no longer supported in
 GROMACS. Use Intel's newer clang-based compiler from oneAPI, or gcc.
 
 The xlc compiler is not supported and version 16.1 does not compile on
-POWER architectures for GROMACS-2026.3. We recommend to use the GCC
+POWER architectures for GROMACS-2026.4. We recommend to use the GCC
 compiler. Note: there are *known issues* with some versions of GCC
 12-14.
 
@@ -728,8 +728,8 @@ the name of the directory containing the "CMakeLists.txt" file of the
 code you want to build. For example, download the source tarball and
 use
 
-   tar xzf gromacs-2026.3.tgz
-   cd gromacs-2026.3
+   tar xzf gromacs-2026.4.tgz
+   cd gromacs-2026.4
    mkdir build-gromacs
    cd build-gromacs
    cmake ..
@@ -1667,7 +1667,7 @@ The simplest way to run the checks is to build GROMACS with
 "-DREGRESSIONTEST_DOWNLOAD", and run "make check". GROMACS will
 automatically download and run the tests for you. Alternatively, you
 can download and unpack the GROMACS regression test suite
-https://ftp.gromacs.org/regressiontests/regressiontests-2026.3.tar.gz
+https://ftp.gromacs.org/regressiontests/regressiontests-2026.4.tar.gz
 tarball yourself and use the advanced "cmake" option
 "REGRESSIONTEST_PATH" to specify the path to the unpacked tarball,
 which will then be used for testing. If the above does not work, then
